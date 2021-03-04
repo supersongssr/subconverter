@@ -3,8 +3,10 @@
 #include <mutex>
 #include <numeric>
 
+#include <inja.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "yamlcpp_extra.h"
 #include "misc.h"
 #include "nodeinfo.h"
 #include "speedtestutil.h"
@@ -15,75 +17,275 @@
 #include "subexport.h"
 #include "multithread.h"
 #include "logger.h"
+#include "string_hash.h"
+#include "templates.h"
+#include "upload.h"
+#include "script_duktape.h"
 
 //common settings
-std::string pref_path = "pref.ini";
-string_array def_exclude_remarks, def_include_remarks, rulesets, stream_rules, time_rules;
-std::vector<ruleset_content> ruleset_content_array;
-std::string listen_address = "127.0.0.1", default_url, insert_url, managed_config_prefix;
-int listen_port = 25500, max_pending_connections = 10, max_concurrent_threads = 4;
-bool api_mode = true, write_managed_config = false, enable_rule_generator = true, update_ruleset_on_request = false, overwrite_original_rules = true;
-bool print_debug_info = false, cfw_child_process = false, append_userinfo = true, enable_base_gen = false;
-std::string access_token;
+std::string gPrefPath = "pref.ini", gDefaultExtConfig;
+string_array gExcludeRemarks, gIncludeRemarks, gCustomRulesets, gStreamNodeRules, gTimeNodeRules;
+std::vector<ruleset_content> gRulesetContent;
+std::string gListenAddress = "127.0.0.1", gDefaultUrls, gInsertUrls, gManagedConfigPrefix;
+int gListenPort = 25500, gMaxPendingConns = 10, gMaxConcurThreads = 4;
+bool gPrependInsert = true, gSkipFailedLinks = false;
+bool gAPIMode = true, gWriteManagedConfig = false, gEnableRuleGen = true, gUpdateRulesetOnRequest = false, gOverwriteOriginalRules = true;
+bool gPrintDbgInfo = false, gCFWChildProcess = false, gAppendUserinfo = true, gAsyncFetchRuleset = false, gSurgeResolveHostname = true;
+std::string gAccessToken, gBasePath = "base";
 extern std::string custom_group;
+extern int gLogLevel;
+extern long gMaxAllowedDownloadSize;
+string_map gAliases;
+
+extern bool gServeFile;
+extern std::string gServeFileRoot;
+
+//global variables for template
+std::string gTemplatePath = "templates";
+string_map gTemplateVars;
 
 //generator settings
-bool generator_mode = false;
-std::string gen_profile;
+bool gGeneratorMode = false;
+std::string gGenerateProfiles;
 
 //multi-thread lock
-std::mutex on_configuring;
+std::mutex gMutexConfigure;
 
 //preferences
-string_array renames, emojis;
-bool add_emoji = false, remove_old_emoji = false, append_proxy_type = false, filter_deprecated = true;
-bool udp_flag = false, tfo_flag = false, scv_flag = false, do_sort = false, config_update_strict = false;
-std::string proxy_config, proxy_ruleset, proxy_subscription;
-int config_update_interval = 0;
+string_array gRenames, gEmojis;
+bool gAddEmoji = false, gRemoveEmoji = false, gAppendType = false, gFilterDeprecated = true;
+tribool gUDP, gTFO, gSkipCertVerify, gTLS13, gEnableInsert;
+bool gEnableSort = false, gUpdateStrict = false;
+bool gClashUseNewField = false;
+std::string gClashProxiesStyle = "flow";
+std::string gProxyConfig, gProxyRuleset, gProxySubscription;
+int gUpdateInterval = 0;
+std::string gSortScript, gFilterScript;
 
-std::string clash_rule_base;
-string_array clash_extra_group;
-std::string surge_rule_base, surfboard_rule_base, mellow_rule_base, quan_rule_base, quanx_rule_base, loon_rule_base;
-std::string surge_ssr_path, quanx_script_id;
-
-//pre-compiled rule bases
-YAML::Node clash_base;
-INIReader surge_base, mellow_base;
+std::string gClashBase;
+string_array gCustomProxyGroups;
+std::string gSurgeBase, gSurfboardBase, gMellowBase, gQuanBase, gQuanXBase, gLoonBase, gSSSubBase;
+std::string gSurgeSSRPath, gQuanXDevID;
 
 //cache system
-int cache_subscription = 60, cache_config = 300, cache_ruleset = 21600;
+bool gServeCacheOnFetchFail = false;
+int gCacheSubscription = 60, gCacheConfig = 300, gCacheRuleset = 21600;
 
-string_array regex_blacklist = {"(.*)*"};
+//limits
+size_t gMaxAllowedRulesets = 64, gMaxAllowedRules = 32768;
 
-template <typename T> void operator >> (const YAML::Node& node, T& i)
+string_array gRegexBlacklist = {"(.*)*"};
+
+void refreshRulesets(string_array &ruleset_list, std::vector<ruleset_content> &ruleset_content_array);
+
+std::string parseProxy(const std::string &source)
 {
-    if(node.IsDefined() && !node.IsNull()) //fail-safe
-        i = node.as<T>();
+    std::string proxy = source;
+    if(source == "SYSTEM")
+        proxy = getSystemProxy();
+    else if(source == "NONE")
+        proxy = "";
+    return proxy;
+}
+
+extern string_array ClashRuleTypes, SurgeRuleTypes, QuanXRuleTypes;
+const std::map<std::string, ruleset_type> RulesetTypes = {{"clash-domain:", RULESET_CLASH_DOMAIN}, {"clash-ipcidr:", RULESET_CLASH_IPCIDR}, {"clash-classic:", RULESET_CLASH_CLASSICAL}, \
+            {"quanx:", RULESET_QUANX}, {"surge:", RULESET_SURGE}};
+
+struct UAProfile
+{
+    std::string head;
+    std::string version_match;
+    std::string version_target;
+    std::string target;
+    tribool clash_new_name = tribool();
+    int surge_ver = -1;
 };
+
+const std::vector<UAProfile> UAMatchList = {
+    {"ClashForAndroid","\\/([0-9.]+)","2.0","clash",true},
+    {"ClashForAndroid","\\/([0-9.]+)R","","clashr",false},
+    {"ClashForAndroid","","","clash",false},
+    {"ClashforWindows","\\/([0-9.]+)","0.11","clash",true},
+    {"ClashforWindows","","","clash",false},
+    {"ClashX Pro","","","clash",true},
+    {"ClashX","\\/([0-9.]+)","0.13","clash",true},
+    {"Clash","","","clash",true},
+    {"Kitsunebi","","","v2ray"},
+    {"Loon","","","loon"},
+    {"Pharos","","","mixed"},
+    {"Potatso","","","mixed"},
+    {"Quantumult%20X","","","quanx"},
+    {"Quantumult","","","quan"},
+    {"Qv2ray","","","v2ray"},
+    {"Shadowrocket","","","mixed"},
+    {"Surfboard","","","surfboard"},
+    {"Surge","\\/([0-9.]+).*x86","906","surge",false,4}, /// Surge for Mac (supports VMess)
+    {"Surge","\\/([0-9.]+).*x86","368","surge",false,3}, /// Surge for Mac (supports new rule types and Shadowsocks without plugin)
+    {"Surge","\\/([0-9.]+)","1419","surge",false,4}, /// Surge iOS 4 (first version)
+    {"Surge","\\/([0-9.]+)","900","surge",false,3}, /// Surge iOS 3 (approx)
+    {"Surge","","","surge",false,2}, /// any version of Surge as fallback
+    {"Trojan-Qt5","","","trojan"},
+    {"V2rayU","","","v2ray"},
+    {"V2RayX","","","v2ray"}
+};
+
+bool verGreaterEqual(const std::string &src_ver, const std::string &target_ver)
+{
+    string_size src_pos_beg = 0, src_pos_end, target_pos_beg = 0, target_pos_end;
+    while(true)
+    {
+        src_pos_end = src_ver.find('.', src_pos_beg);
+        if(src_pos_end == src_ver.npos)
+            src_pos_end = src_ver.size();
+        int part_src = std::stoi(src_ver.substr(src_pos_beg, src_pos_end - src_pos_beg));
+        target_pos_end = target_ver.find('.', target_pos_beg);
+        if(target_pos_end == target_ver.npos)
+            target_pos_end = target_ver.size();
+        int part_target = std::stoi(target_ver.substr(target_pos_beg, target_pos_end - target_pos_beg));
+        if(part_src > part_target)
+            break;
+        else if(part_src < part_target)
+            return false;
+        else if(src_pos_end >= src_ver.size() - 1 || target_pos_end >= target_ver.size() - 1)
+            break;
+        src_pos_beg = src_pos_end + 1;
+        target_pos_beg = target_pos_end + 1;
+    }
+    return true;
+
+}
+
+void matchUserAgent(const std::string &user_agent, std::string &target, tribool &clash_new_name, int &surge_ver)
+{
+    if(user_agent.empty())
+        return;
+    for(const UAProfile &x : UAMatchList)
+    {
+        if(startsWith(user_agent, x.head))
+        {
+            if(!x.version_match.empty())
+            {
+                std::string version;
+                if(regGetMatch(user_agent, x.version_match, 2, 0, &version))
+                    continue;
+                if(!x.version_target.empty() && !verGreaterEqual(version, x.version_target))
+                    continue;
+            }
+            target = x.target;
+            clash_new_name = x.clash_new_name;
+            if(x.surge_ver != -1)
+                surge_ver = x.surge_ver;
+            return;
+        }
+    }
+    return;
+}
+
+std::string convertRuleset(const std::string &content, int type)
+{
+    /// Target: Surge type,pattern[,flag]
+    /// Source: QuanX type,pattern[,group]
+    ///         Clash payload:\n  - 'ipcidr/domain/classic(Surge-like)'
+
+    std::string output, strLine;
+
+    if(type == RULESET_SURGE)
+        return content;
+
+    if(startsWith(content, "payload:")) /// Clash
+    {
+        output = regReplace(regReplace(content, "payload:\\r?\\n", "", true), "\\s?^\\s*-\\s+('?)(.*)\\1$", "\n$2", true);
+        if(type == RULESET_CLASH_CLASSICAL) /// classical type
+            return output;
+        std::stringstream ss;
+        ss << output;
+        char delimiter = getLineBreak(output);
+        output.clear();
+        string_size pos, lineSize;
+        while(getline(ss, strLine, delimiter))
+        {
+            strLine = trim(strLine);
+            lineSize = strLine.size();
+            if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
+                strLine.erase(--lineSize);
+
+            if(!strLine.empty() && (strLine[0] != ';' && strLine[0] != '#' && !(lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')))
+            {
+                pos = strLine.find("/");
+                if(pos != strLine.npos) /// ipcidr
+                {
+                    if(isIPv4(strLine.substr(0, pos)))
+                        output += "IP-CIDR,";
+                    else
+                        output += "IP-CIDR6,";
+                }
+                else
+                {
+                    if(strLine[0] == '.' || (lineSize >= 2 && strLine[0] == '+' && strLine[1] == '.')) /// suffix
+                    {
+                        bool keyword_flag = false;
+                        while(endsWith(strLine, ".*"))
+                        {
+                            keyword_flag = true;
+                            strLine.erase(strLine.size() - 2);
+                        }
+                        output += "DOMAIN-";
+                        if(keyword_flag)
+                            output += "KEYWORD,";
+                        else
+                            output += "SUFFIX,";
+                        strLine.erase(0, 2 - (strLine[0] == '.'));
+                    }
+                    else
+                        output += "DOMAIN,";
+                }
+            }
+            output += strLine;
+            output += '\n';
+        }
+        return output;
+    }
+    else /// QuanX
+    {
+        output = regReplace(regReplace(content, "^(?i:host)", "DOMAIN", true), "^(?i:ip6-cidr)", "IP-CIDR6", true); //translate type
+        output = regReplace(output, "^((?i:DOMAIN(?:-(?:SUFFIX|KEYWORD))?|IP-CIDR6?|USER-AGENT),)\\s*?(\\S*?)(?:,(?!no-resolve).*?)(,no-resolve)?$", "\\U$1\\E$2${3:-}", true); //remove group
+        return output;
+    }
+}
+
+std::string getConvertedRuleset(RESPONSE_CALLBACK_ARGS)
+{
+    std::string url = UrlDecode(getUrlArg(request.argument, "url")), type = getUrlArg(request.argument, "type");
+    return convertRuleset(fetchFile(url, parseProxy(gProxyRuleset), gCacheRuleset), to_int(type));
+}
 
 std::string getRuleset(RESPONSE_CALLBACK_ARGS)
 {
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
+    /// type: 1 for Surge, 2 for Quantumult X, 3 for Clash domain rule-provider, 4 for Clash ipcidr rule-provider, 5 for Surge DOMAIN-SET, 6 for Clash classical ruleset
     std::string url = urlsafe_base64_decode(getUrlArg(argument, "url")), type = getUrlArg(argument, "type"), group = urlsafe_base64_decode(getUrlArg(argument, "group"));
     std::string output_content, dummy;
+    int type_int = to_int(type, 0);
 
-    if(!url.size() || !type.size() || (type == "2" && !group.size()) || (type != "1" && type != "2"))
+    if(!url.size() || !type.size() || (type_int == 2 && !group.size()) || (type_int < 1 || type_int > 6))
     {
         *status_code = 400;
         return "Invalid request!";
     }
 
-    std::string proxy;
-    if(proxy_ruleset == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_ruleset == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_ruleset;
-
-    if(fileExist(url))
-        output_content = fileGet(url, true);
-    else
-        output_content = webGet(url, proxy, dummy, cache_ruleset);
+    std::string proxy = parseProxy(gProxyRuleset);
+    string_array vArray = split(url, "|");
+    for(std::string &x : vArray)
+        x.insert(0, "ruleset,");
+    std::vector<ruleset_content> rca;
+    refreshRulesets(vArray, rca);
+    for(ruleset_content &x : rca)
+    {
+        std::string content = x.rule_content.get();
+        output_content += convertRuleset(content, x.rule_type);
+    }
 
     if(!output_content.size())
     {
@@ -91,52 +293,129 @@ std::string getRuleset(RESPONSE_CALLBACK_ARGS)
         return "Invalid request!";
     }
 
-    if(type == "2")
+    std::string strLine;
+    std::stringstream ss;
+    const std::string rule_match_regex = "^(.*?,.*?)(,.*)(,.*)$";
+
+    ss << output_content;
+    char delimiter = getLineBreak(output_content);
+    std::string::size_type lineSize, posb, pose;
+    auto filterLine = [&]()
     {
-        std::string strLine;
-        std::stringstream ss;
-        const std::string rule_match_regex = "^(.*?,.*?)(,.*)(,.*)$";
-
-        ss << output_content;
-        char delimiter = count(output_content.begin(), output_content.end(), '\n') < 1 ? '\r' : '\n';
-        std::string::size_type lineSize;
-
-        output_content.clear();
-
-        while(getline(ss, strLine, delimiter))
+        posb = 0;
+        pose = strLine.find(',');
+        if(pose == strLine.npos)
+            return 1;
+        posb = pose + 1;
+        pose = strLine.find(',', posb);
+        if(pose == strLine.npos)
         {
-            if(strLine.find("IP-CIDR6") == 0 || strLine.find("URL-REGEX") == 0 || strLine.find("PROCESS-NAME") == 0 || strLine.find("AND") == 0 || strLine.find("OR") == 0) //remove unsupported types
+            pose = strLine.size();
+            if(strLine[pose - 1] == '\r')
+                pose--;
+        }
+        else
+            pose -= posb;
+        return 0;
+    };
+
+    lineSize = output_content.size();
+    output_content.clear();
+    output_content.reserve(lineSize);
+
+    if(type_int == 3 || type_int == 4 || type_int == 6)
+        output_content = "payload:\n";
+
+    while(getline(ss, strLine, delimiter))
+    {
+        switch(type_int)
+        {
+        case 2:
+            if(!std::any_of(QuanXRuleTypes.begin(), QuanXRuleTypes.end(), [&strLine](std::string type){return startsWith(strLine, type);}))
                 continue;
+            break;
+        case 1:
+            if(!std::any_of(SurgeRuleTypes.begin(), SurgeRuleTypes.end(), [&strLine](std::string type){return startsWith(strLine, type);}))
+                continue;
+            break;
+        case 3:
+            if(!startsWith(strLine, "DOMAIN-SUFFIX,") && !startsWith(strLine, "DOMAIN,"))
+                continue;
+            if(filterLine())
+                continue;
+            output_content += "  - '";
+            if(strLine[posb - 2] == 'X')
+                output_content += "+.";
+            output_content += strLine.substr(posb, pose);
+            output_content += "'\n";
+            continue;
+        case 4:
+            if(!startsWith(strLine, "IP-CIDR,") && !startsWith(strLine, "IP-CIDR6,"))
+                continue;
+            if(filterLine())
+                continue;
+            output_content += "  - '";
+            output_content += strLine.substr(posb, pose);
+            output_content += "'\n";
+            continue;
+        case 5:
+            if(!startsWith(strLine, "DOMAIN-SUFFIX,") && !startsWith(strLine, "DOMAIN,"))
+                continue;
+            if(filterLine())
+                continue;
+            output_content += strLine.substr(posb, pose);
+            output_content += '\n';
+            continue;
+        case 6:
+            if(!std::any_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](std::string type){return startsWith(strLine, type);}))
+                continue;
+            output_content += "  - ";
+        }
 
-            lineSize = strLine.size();
-            if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
-            {
-                strLine.erase(lineSize - 1);
-                lineSize--;
-            }
+        lineSize = strLine.size();
+        if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
+            strLine.erase(--lineSize);
 
-            if(!strLine.empty() && (strLine[0] != ';' && strLine[0] != '#' && !(lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')))
+        if(!strLine.empty() && (strLine[0] != ';' && strLine[0] != '#' && !(lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')))
+        {
+            if(type_int == 2)
             {
+                if(startsWith(strLine, "IP-CIDR6"))
+                    strLine.replace(0, 8, "IP6-CIDR");
                 strLine += "," + group;
-
-                if(std::count(strLine.begin(), strLine.end(), ',') > 2 && regReplace(strLine, rule_match_regex, "$2") == ",no-resolve")
+                if(count_least(strLine, ',', 3) && regReplace(strLine, rule_match_regex, "$2") == ",no-resolve")
                     strLine = regReplace(strLine, rule_match_regex, "$1$3$2");
                 else
                     strLine = regReplace(strLine, rule_match_regex, "$1$3");
             }
-
-            output_content.append(strLine + "\n");
         }
+        output_content += strLine;
+        output_content += '\n';
     }
 
+    if(output_content == "payload:\n")
+    {
+        switch(type_int)
+        {
+        case 3:
+            output_content += "  - '--placeholder--'";
+            break;
+        case 4:
+            output_content += "  - '0.0.0.0/32'";
+            break;
+        case 6:
+            output_content += "  - 'DOMAIN,--placeholder--'";
+            break;
+        }
+    }
     return output_content;
 }
 
-int importItems(string_array &target)
+int importItems(string_array &target, bool scope_limit = true)
 {
     string_array result;
     std::stringstream ss;
-    std::string path, content, strLine, dummy;
+    std::string path, content, strLine;
     unsigned int itemCount = 0;
     for(std::string &x : target)
     {
@@ -148,35 +427,28 @@ int importItems(string_array &target)
         path = x.substr(x.find(":") + 1);
         writeLog(0, "Trying to import items from " + path);
 
-        std::string proxy;
-        if(proxy_ruleset == "SYSTEM")
-            proxy = getSystemProxy();
-        else if(proxy_ruleset == "NONE")
-            proxy = "";
-        else
-            proxy = proxy_ruleset;
+        std::string proxy = parseProxy(gProxyConfig);
 
         if(fileExist(path))
-            content = fileGet(path, api_mode);
+            content = fileGet(path, scope_limit);
+        else if(isLink(path))
+            content = webGet(path, proxy, gCacheConfig);
         else
-            content = webGet(path, proxy, dummy, cache_config);
+            writeLog(0, "File not found or not a valid URL: " + path, LOG_LEVEL_ERROR);
         if(!content.size())
             return -1;
 
         ss << content;
-        char delimiter = count(content.begin(), content.end(), '\n') < 1 ? '\r' : '\n';
+        char delimiter = getLineBreak(content);
         std::string::size_type lineSize;
         while(getline(ss, strLine, delimiter))
         {
             lineSize = strLine.size();
             if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
-            {
-                strLine = strLine.substr(0, lineSize - 1);
-                lineSize--;
-            }
+                strLine.erase(--lineSize);
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            result.emplace_back(strLine);
+            result.emplace_back(std::move(strLine));
             itemCount++;
         }
         ss.clear();
@@ -186,61 +458,72 @@ int importItems(string_array &target)
     return 0;
 }
 
-void readRegexMatch(YAML::Node node, std::string delimiter, string_array &dest)
+void readRegexMatch(YAML::Node node, const std::string &delimiter, string_array &dest, bool scope_limit = true)
 {
     YAML::Node object;
-    std::string url, match, rep, strLine;
+    std::string script, url, match, rep, strLine;
 
     for(unsigned i = 0; i < node.size(); i++)
     {
         object = node[i];
-        object["import"] >> url;
-        if(url.size())
+        object["script"] >>= script;
+        if(script.size())
         {
-            url = "!!import:" + url;
-            dest.emplace_back(url);
+            dest.emplace_back("!!script:" + script);
             continue;
         }
-        object["match"] >> match;
-        object["replace"] >> rep;
+        object["import"] >>= url;
+        if(url.size())
+        {
+            dest.emplace_back("!!import:" + url);
+            continue;
+        }
+        object["match"] >>= match;
+        object["replace"] >>= rep;
         if(match.size() && rep.size())
             strLine = match + delimiter + rep;
         else
             continue;
-        dest.emplace_back(strLine);
+        dest.emplace_back(std::move(strLine));
     }
-    importItems(dest);
+    importItems(dest, scope_limit);
 }
 
-void readEmoji(YAML::Node node, string_array &dest)
+void readEmoji(YAML::Node node, string_array &dest, bool scope_limit = true)
 {
     YAML::Node object;
-    std::string url, match, rep, strLine;
+    std::string script, url, match, rep, strLine;
 
     for(unsigned i = 0; i < node.size(); i++)
     {
         object = node[i];
-        object["import"] >> url;
+        object["script"] >>= script;
+        if(script.size())
+        {
+            dest.emplace_back("!!script:" + script);
+            continue;
+        }
+        object["import"] >>= url;
         if(url.size())
         {
             url = "!!import:" + url;
             dest.emplace_back(url);
             continue;
         }
-        object["match"] >> match;
-        object["emoji"] >> rep;
+        object["match"] >>= match;
+        object["emoji"] >>= rep;
         if(match.size() && rep.size())
             strLine = match + "," + rep;
         else
             continue;
-        dest.emplace_back(strLine);
+        dest.emplace_back(std::move(strLine));
     }
-    importItems(dest);
+    importItems(dest, scope_limit);
 }
 
-void readGroup(YAML::Node node, string_array &dest)
+void readGroup(YAML::Node node, string_array &dest, bool scope_limit = true)
 {
-    std::string strLine, name, type, url, interval;
+    std::string strLine, name, type;
     string_array tempArray;
     YAML::Node object;
     unsigned int i, j;
@@ -249,123 +532,124 @@ void readGroup(YAML::Node node, string_array &dest)
     {
         eraseElements(tempArray);
         object = node[i];
-        object["import"] >> name;
+        object["import"] >>= name;
         if(name.size())
         {
-            name = "!!import:" + name;
-            dest.emplace_back(name);
+            dest.emplace_back("!!import:" + name);
             continue;
         }
-        url = "http://www.gstatic.com/generate_204", interval = "300";
-        object["name"] >> name;
-        object["type"] >> type;
-        tempArray.emplace_back(name);
+        std::string url = "http://www.gstatic.com/generate_204", interval = "300", tolerance, timeout;
+        object["name"] >>= name;
+        object["type"] >>= type;
+        tempArray.emplace_back(std::move(name));
         tempArray.emplace_back(type);
-        object["url"] >> url;
-        object["interval"] >> interval;
+        object["url"] >>= url;
+        object["interval"] >>= interval;
+        object["tolerance"] >>= tolerance;
+        object["timeout"] >>= timeout;
         for(j = 0; j < object["rule"].size(); j++)
-            tempArray.emplace_back(object["rule"][j].as<std::string>());
-        if(type != "select" && type != "ssid")
+            tempArray.emplace_back(safe_as<std::string>(object["rule"][j]));
+        switch(hash_(type))
         {
-            tempArray.emplace_back(url);
-            tempArray.emplace_back(interval);
+        case "select"_hash:
+            if(tempArray.size() < 3)
+                continue;
+            break;
+        case "ssid"_hash:
+            if(tempArray.size() < 4)
+                continue;
+            break;
+        default:
+            if(tempArray.size() < 3)
+                continue;
+            tempArray.emplace_back(std::move(url));
+            tempArray.emplace_back(interval + "," + timeout + "," + tolerance);
         }
-
-        if((type == "select" && tempArray.size() < 3) || (type == "ssid" && tempArray.size() < 4) || (type != "select" && type != "ssid" && tempArray.size() < 5))
-            continue;
 
         strLine = std::accumulate(std::next(tempArray.begin()), tempArray.end(), tempArray[0], [](std::string a, std::string b) -> std::string
         {
             return std::move(a) + "`" + std::move(b);
         });
-        dest.emplace_back(strLine);
+        dest.emplace_back(std::move(strLine));
     }
-    importItems(dest);
+    importItems(dest, scope_limit);
 }
 
-void readRuleset(YAML::Node node, string_array &dest)
+void readRuleset(YAML::Node node, string_array &dest, bool scope_limit = true)
 {
-    std::string strLine, name, url, group;
+    std::string strLine, name, url, group, interval;
     YAML::Node object;
 
     for(unsigned int i = 0; i < node.size(); i++)
     {
-        name = "";
         object = node[i];
-        object["import"] >> name;
+        object["import"] >>= name;
         if(name.size())
         {
-            name = "!!import:" + name;
-            dest.emplace_back(name);
+            dest.emplace_back("!!import:" + name);
             continue;
         }
-        object["ruleset"] >> url;
-        object["group"] >> group;
-        object["rule"] >> name;
+        object["ruleset"] >>= url;
+        object["group"] >>= group;
+        object["rule"] >>= name;
+        object["interval"] >>= interval;
         if(url.size())
+        {
             strLine = group + "," + url;
+            if(interval.size())
+                strLine += "," + interval;
+        }
         else if(name.size())
             strLine = group + ",[]" + name;
         else
             continue;
-        dest.emplace_back(strLine);
+        dest.emplace_back(std::move(strLine));
     }
-    importItems(dest);
+    importItems(dest, scope_limit);
 }
 
-void refreshRulesets(string_array &ruleset_list, std::vector<ruleset_content> &rca)
+void refreshRulesets(string_array &ruleset_list, std::vector<ruleset_content> &ruleset_content_array)
 {
-    eraseElements(rca);
-    std::string rule_group, rule_url, dummy;
+    eraseElements(ruleset_content_array);
+    std::string rule_group, rule_url, rule_url_typed, interval;
     ruleset_content rc;
 
-    std::string proxy;
-    if(proxy_ruleset == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_ruleset == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_ruleset;
+    std::string proxy = parseProxy(gProxyRuleset);
 
     for(std::string &x : ruleset_list)
     {
-        /*
-        vArray = split(x, ",");
-        if(vArray.size() != 2)
+        string_size pos = x.find(",");
+        if(pos == x.npos || pos == x.size() - 1)
             continue;
-        rule_group = trim(vArray[0]);
-        rule_url = trim(vArray[1]);
-        */
-        if(x.find(",") == x.npos)
-            continue;
-        rule_group = trim(x.substr(0, x.find(",")));
-        rule_url = trim(x.substr(x.find(",") + 1));
-        if(rule_url.find("[]") == 0)
+        rule_group = trim(x.substr(0, pos));
+        if(x.find("[]", pos + 1) == pos + 1)
         {
-            std::cerr<<"Adding rule '"<<rule_url.substr(2)<<","<<rule_group<<"'."<<std::endl;
-            rc = {rule_group, "", rule_url};
-            rca.emplace_back(rc);
-            continue;
+            rule_url = trim(x.substr(pos + 1));
+            writeLog(0, "Adding rule '" + rule_url.substr(2) + "," + rule_group + "'.", LOG_LEVEL_INFO);
+            rc = {rule_group, "", "", RULESET_SURGE, std::async(std::launch::async, [rule_url](){return rule_url;}), 0};
         }
         else
         {
-            std::cerr<<"Updating ruleset url '"<<rule_url<<"' with group '"<<rule_group<<"'."<<std::endl;
-            if(fileExist(rule_url))
-            {
-                rc = {rule_group, rule_url, fileGet(rule_url)};
-            }
-            else if(startsWith(rule_url, "http://") || startsWith(rule_url, "https://") || startsWith(rule_url, "data:"))
-            {
-                rc = {rule_group, rule_url, webGet(rule_url, proxy, dummy, cache_ruleset)};
-            }
+            string_size pos2 = x.find(",", pos + 1);
+            rule_url = trim(x.substr(pos + 1, pos2 - pos - 1));
+            if(pos2 != x.npos)
+                interval = x.substr(pos2 + 1);
             else
-                continue;
+                interval.clear();
+            ruleset_type type = RULESET_SURGE;
+            rule_url_typed = rule_url;
+            auto iter = std::find_if(RulesetTypes.begin(), RulesetTypes.end(), [rule_url](auto y){ return startsWith(rule_url, y.first); });
+            if(iter != RulesetTypes.end())
+            {
+                rule_url.erase(0, iter->first.size());
+                type = iter->second;
+            }
+            writeLog(0, "Updating ruleset url '" + rule_url + "' with group '" + rule_group + "'.", LOG_LEVEL_INFO);
+            rc = {rule_group, rule_url, rule_url_typed, type, fetchFileAsync(rule_url, proxy, gCacheRuleset, gAsyncFetchRuleset), to_int(interval, 0)};
         }
-        if(rc.rule_content.size())
-            rca.emplace_back(rc);
-        else
-            std::cerr<<"Warning: No data was fetched from this link. Skipping..."<<std::endl;
+        ruleset_content_array.emplace_back(std::move(rc));
     }
+    ruleset_content_array.shrink_to_fit();
 }
 
 void readYAMLConf(YAML::Node &node)
@@ -374,57 +658,71 @@ void readYAMLConf(YAML::Node &node)
     std::string strLine;
     string_array tempArray;
 
-    section["api_mode"] >> api_mode;
-    section["api_access_token"] >> access_token;
+    section["api_mode"] >> gAPIMode;
+    section["api_access_token"] >> gAccessToken;
     if(section["default_url"].IsSequence())
     {
         section["default_url"] >> tempArray;
         if(tempArray.size())
-            strLine = std::accumulate(std::next(tempArray.begin()), tempArray.end(), tempArray[0], [](std::string a, std::string b)
         {
-            return std::move(a) + "|" + std::move(b);
-        });
-        default_url = strLine;
+            strLine = std::accumulate(std::next(tempArray.begin()), tempArray.end(), tempArray[0], [](std::string a, std::string b)
+            {
+                return std::move(a) + "|" + std::move(b);
+            });
+            gDefaultUrls = strLine;
+            eraseElements(tempArray);
+        }
     }
+    gEnableInsert = safe_as<std::string>(section["enable_insert"]);
     if(section["insert_url"].IsSequence())
     {
         section["insert_url"] >> tempArray;
         if(tempArray.size())
-            strLine = std::accumulate(std::next(tempArray.begin()), tempArray.end(), tempArray[0], [](std::string a, std::string b)
         {
-            return std::move(a) + "|" + std::move(b);
-        });
-        insert_url = strLine;
+            strLine = std::accumulate(std::next(tempArray.begin()), tempArray.end(), tempArray[0], [](std::string a, std::string b)
+            {
+                return std::move(a) + "|" + std::move(b);
+            });
+            gInsertUrls = strLine;
+            eraseElements(tempArray);
+        }
     }
+    section["prepend_insert_url"] >> gPrependInsert;
     if(section["exclude_remarks"].IsSequence())
-        section["exclude_remarks"] >> def_exclude_remarks;
+        section["exclude_remarks"] >> gExcludeRemarks;
     if(section["include_remarks"].IsSequence())
-        section["include_remarks"] >> def_include_remarks;
-    section["clash_rule_base"] >> clash_rule_base;
-    section["surge_rule_base"] >> surge_rule_base;
-    section["surfboard_rule_base"] >> surfboard_rule_base;
-    section["mellow_rule_base"] >> mellow_rule_base;
-    section["quan_rule_base"] >> quan_rule_base;
-    section["quanx_rule_base"] >> quanx_rule_base;
-    section["loon_rule_base"] >> loon_rule_base;
+        section["include_remarks"] >> gIncludeRemarks;
+    gFilterScript = safe_as<bool>(section["enable_filter"]) ? safe_as<std::string>(section["filter_script"]) : "";
+    if(startsWith(gFilterScript, "path:"))
+        gFilterScript = fileGet(gFilterScript.substr(5), false);
+    section["base_path"] >> gBasePath;
+    section["clash_rule_base"] >> gClashBase;
+    section["surge_rule_base"] >> gSurgeBase;
+    section["surfboard_rule_base"] >> gSurfboardBase;
+    section["mellow_rule_base"] >> gMellowBase;
+    section["quan_rule_base"] >> gQuanBase;
+    section["quanx_rule_base"] >> gQuanXBase;
+    section["loon_rule_base"] >> gLoonBase;
+    section["sssub_rule_base"] >> gSSSubBase;
 
-    section["append_proxy_type"] >> append_proxy_type;
-    section["proxy_config"] >> proxy_config;
-    section["proxy_ruleset"] >> proxy_ruleset;
-    section["proxy_subscription"] >> proxy_subscription;
+    section["default_external_config"] >> gDefaultExtConfig;
+    section["append_proxy_type"] >> gAppendType;
+    section["proxy_config"] >> gProxyConfig;
+    section["proxy_ruleset"] >> gProxyRuleset;
+    section["proxy_subscription"] >> gProxySubscription;
 
     if(node["userinfo"].IsDefined())
     {
         section = node["userinfo"];
         if(section["stream_rule"].IsSequence())
         {
-            readRegexMatch(section["stream_rule"], "@", tempArray);
+            readRegexMatch(section["stream_rule"], "|", tempArray, false);
             safe_set_streams(tempArray);
             eraseElements(tempArray);
         }
         if(section["time_rule"].IsSequence())
         {
-            readRegexMatch(section["time_rule"], "@", tempArray);
+            readRegexMatch(section["time_rule"], "|", tempArray, false);
             safe_set_times(tempArray);
             eraseElements(tempArray);
         }
@@ -433,17 +731,26 @@ void readYAMLConf(YAML::Node &node)
     if(node["node_pref"].IsDefined())
     {
         section = node["node_pref"];
+        /*
         section["udp_flag"] >> udp_flag;
         section["tcp_fast_open_flag"] >> tfo_flag;
-        section["sort_flag"] >> do_sort;
         section["skip_cert_verify_flag"] >> scv_flag;
-        section["filter_deprecated_nodes"] >> filter_deprecated;
-        section["append_sub_userinfo"] >> append_userinfo;
+        */
+        gUDP.set(safe_as<std::string>(section["udp_flag"]));
+        gTFO.set(safe_as<std::string>(section["tcp_fast_open_flag"]));
+        gSkipCertVerify.set(safe_as<std::string>(section["skip_cert_verify_flag"]));
+        gTLS13.set(safe_as<std::string>(section["tls13_flag"]));
+        section["sort_flag"] >> gEnableSort;
+        section["sort_script"] >> gSortScript;
+        section["filter_deprecated_nodes"] >> gFilterDeprecated;
+        section["append_sub_userinfo"] >> gAppendUserinfo;
+        section["clash_use_new_field_name"] >> gClashUseNewField;
+        section["clash_proxies_style"] >> gClashProxiesStyle;
     }
 
     if(section["rename_node"].IsSequence())
     {
-        readRegexMatch(section["rename_node"], "@", tempArray);
+        readRegexMatch(section["rename_node"], "@", tempArray, false);
         safe_set_renames(tempArray);
         eraseElements(tempArray);
     }
@@ -451,91 +758,164 @@ void readYAMLConf(YAML::Node &node)
     if(node["managed_config"].IsDefined())
     {
         section = node["managed_config"];
-        section["write_managed_config"] >> write_managed_config;
-        section["managed_config_prefix"] >> managed_config_prefix;
-        section["config_update_interval"] >> config_update_interval;
-        section["config_update_strict"] >> config_update_strict;
-        section["quanx_device_id"] >> quanx_script_id;
+        section["write_managed_config"] >> gWriteManagedConfig;
+        section["managed_config_prefix"] >> gManagedConfigPrefix;
+        section["config_update_interval"] >> gUpdateInterval;
+        section["config_update_strict"] >> gUpdateStrict;
+        section["quanx_device_id"] >> gQuanXDevID;
     }
 
     if(node["surge_external_proxy"].IsDefined())
-        node["surge_external_proxy"]["surge_ssr_path"] >> surge_ssr_path;
+    {
+        node["surge_external_proxy"]["surge_ssr_path"] >> gSurgeSSRPath;
+        node["surge_external_proxy"]["resolve_hostname"] >> gSurgeResolveHostname;
+    }
 
     if(node["emojis"].IsDefined())
     {
         section = node["emojis"];
-        section["add_emoji"] >> add_emoji;
-        section["remove_old_emoji"] >> remove_old_emoji;
+        section["add_emoji"] >> gAddEmoji;
+        section["remove_old_emoji"] >> gRemoveEmoji;
         if(section["rules"].IsSequence())
         {
-            readEmoji(section["rules"], tempArray);
+            readEmoji(section["rules"], tempArray, false);
             safe_set_emojis(tempArray);
             eraseElements(tempArray);
         }
     }
 
-    if(node["ruleset"].IsDefined())
+    const char *rulesets_title = node["rulesets"].IsDefined() ? "rulesets" : "ruleset";
+    if(node[rulesets_title].IsDefined())
     {
-        section = node["ruleset"];
-        section["enabled"] >> enable_rule_generator;
-        if(!enable_rule_generator)
+        section = node[rulesets_title];
+        section["enabled"] >> gEnableRuleGen;
+        if(!gEnableRuleGen)
         {
-            overwrite_original_rules = false;
-            update_ruleset_on_request = false;
+            gOverwriteOriginalRules = false;
+            gUpdateRulesetOnRequest = false;
         }
         else
         {
-            section["overwrite_original_rules"] >> overwrite_original_rules;
-            section["update_ruleset_on_request"] >> update_ruleset_on_request;
+            section["overwrite_original_rules"] >> gOverwriteOriginalRules;
+            section["update_ruleset_on_request"] >> gUpdateRulesetOnRequest;
         }
-        if(section["surge_ruleset"].IsSequence())
-            readRuleset(section["surge_ruleset"], rulesets);
+        const char *ruleset_title = section["rulesets"].IsDefined() ? "rulesets" : "surge_ruleset";
+        if(section[ruleset_title].IsSequence())
+            readRuleset(section[ruleset_title], gCustomRulesets, false);
     }
 
-    if(node["proxy_group"].IsDefined() && node["proxy_group"]["custom_proxy_group"].IsDefined())
-        readGroup(node["proxy_group"]["custom_proxy_group"], clash_extra_group);
+    const char *groups_title = node["proxy_groups"].IsDefined() ? "proxy_groups" : "proxy_group";
+    if(node[groups_title].IsDefined() && node[groups_title]["custom_proxy_group"].IsDefined())
+        readGroup(node[groups_title]["custom_proxy_group"], gCustomProxyGroups, false);
+
+    if(node["template"].IsDefined())
+    {
+        node["template"]["template_path"] >> gTemplatePath;
+        if(node["template"]["globals"].IsSequence())
+        {
+            eraseElements(gTemplateVars);
+            for(size_t i = 0; i < node["template"]["globals"].size(); i++)
+            {
+                std::string key, value;
+                node["template"]["globals"][i]["key"] >> key;
+                node["template"]["globals"][i]["value"] >> value;
+                gTemplateVars[key] = value;
+            }
+        }
+    }
+
+    if(node["aliases"].IsSequence())
+    {
+        reset_redirect();
+        for(size_t i = 0; i < node["aliases"].size(); i++)
+        {
+            std::string uri, target;
+            node["aliases"][i]["uri"] >> uri;
+            node["aliases"][i]["target"] >> target;
+            append_redirect(uri, target);
+        }
+    }
 
     if(node["server"].IsDefined())
     {
-        node["server"]["listen"] >> listen_address;
-        node["server"]["port"] >> listen_port;
+        node["server"]["listen"] >> gListenAddress;
+        node["server"]["port"] >> gListenPort;
+        node["server"]["serve_file_root"] >>= gServeFileRoot;
+        gServeFile = !gServeFileRoot.empty();
     }
 
     if(node["advanced"].IsDefined())
     {
-        node["advanced"]["print_debug_info"] >> print_debug_info;
-        node["advanced"]["max_pending_connections"] >> max_pending_connections;
-        node["advanced"]["max_concurrent_threads"] >> max_concurrent_threads;
-        node["advanced"]["enable_base_gen"] >> enable_base_gen;
+        std::string log_level;
+        node["advanced"]["log_level"] >> log_level;
+        node["advanced"]["print_debug_info"] >> gPrintDbgInfo;
+        if(gPrintDbgInfo)
+            gLogLevel = LOG_LEVEL_VERBOSE;
+        else
+        {
+            switch(hash_(log_level))
+            {
+            case "warn"_hash:
+                gLogLevel = LOG_LEVEL_WARNING;
+                break;
+            case "error"_hash:
+                gLogLevel = LOG_LEVEL_ERROR;
+                break;
+            case "fatal"_hash:
+                gLogLevel = LOG_LEVEL_FATAL;
+                break;
+            case "verbose"_hash:
+                gLogLevel = LOG_LEVEL_VERBOSE;
+                break;
+            case "debug"_hash:
+                gLogLevel = LOG_LEVEL_DEBUG;
+                break;
+            default:
+                gLogLevel = LOG_LEVEL_INFO;
+            }
+        }
+        node["advanced"]["max_pending_connections"] >> gMaxPendingConns;
+        node["advanced"]["max_concurrent_threads"] >> gMaxConcurThreads;
+        node["advanced"]["max_allowed_rulesets"] >> gMaxAllowedRulesets;
+        node["advanced"]["max_allowed_rules"] >> gMaxAllowedRules;
+        node["advanced"]["max_allowed_download_size"] >> gMaxAllowedDownloadSize;
         if(node["advanced"]["enable_cache"].IsDefined())
         {
-            if(node["advanced"]["enable_cache"].as<bool>())
+            if(safe_as<bool>(node["advanced"]["enable_cache"]))
             {
-                node["advanced"]["cache_subscription"] >> cache_subscription;
-                node["advanced"]["cache_config"] >> cache_config;
-                node["advanced"]["cache_ruleset"] >> cache_ruleset;
+                node["advanced"]["cache_subscription"] >> gCacheSubscription;
+                node["advanced"]["cache_config"] >> gCacheConfig;
+                node["advanced"]["cache_ruleset"] >> gCacheRuleset;
+                node["advanced"]["serve_cache_on_fetch_fail"] >> gServeCacheOnFetchFail;
             }
             else
-                cache_subscription = cache_config = cache_ruleset = 0; //disable cache
+                gCacheSubscription = gCacheConfig = gCacheRuleset = 0; //disable cache
         }
+        node["advanced"]["async_fetch_ruleset"] >> gAsyncFetchRuleset;
+        node["advanced"]["skip_failed_links"] >> gSkipFailedLinks;
     }
 }
 
 void readConf()
 {
-    guarded_mutex guard(on_configuring);
-    std::cerr<<"Reading preference settings..."<<std::endl;
+    guarded_mutex guard(gMutexConfigure);
+    //std::cerr<<"Reading preference settings..."<<std::endl;
+    writeLog(0, "Reading preference settings...", LOG_LEVEL_INFO);
 
-    eraseElements(def_exclude_remarks);
-    eraseElements(def_include_remarks);
-    eraseElements(clash_extra_group);
-    eraseElements(rulesets);
+    eraseElements(gExcludeRemarks);
+    eraseElements(gIncludeRemarks);
+    eraseElements(gCustomProxyGroups);
+    eraseElements(gCustomRulesets);
 
     try
     {
-        YAML::Node yaml = YAML::LoadFile(pref_path);
-        if(yaml.size() && yaml["common"])
-            return readYAMLConf(yaml);
+        std::string prefdata = fileGet(gPrefPath, false);
+        if(prefdata.find("common:") != prefdata.npos)
+        {
+            YAML::Node yaml = YAML::Load(prefdata);
+            if(yaml.size() && yaml["common"])
+                return readYAMLConf(yaml);
+        }
     }
     catch (YAML::Exception &e)
     {
@@ -545,77 +925,71 @@ void readConf()
     INIReader ini;
     ini.allow_dup_section_titles = true;
     //ini.do_utf8_to_gbk = true;
-    int retVal = ini.ParseFile(pref_path);
+    int retVal = ini.ParseFile(gPrefPath);
     if(retVal != INIREADER_EXCEPTION_NONE)
     {
-        std::cerr<<"Unable to load preference settings. Reason: "<<ini.GetLastError()<<"\n";
+        //std::cerr<<"Unable to load preference settings. Reason: "<<ini.GetLastError()<<"\n";
+        writeLog(0, "Unable to load preference settings. Reason: " + ini.GetLastError(), LOG_LEVEL_FATAL);
         return;
     }
 
     string_array tempArray;
 
     ini.EnterSection("common");
-    if(ini.ItemExist("api_mode"))
-        api_mode = ini.GetBool("api_mode");
-    if(ini.ItemExist("api_access_token"))
-        access_token = ini.Get("api_access_token");
-    if(ini.ItemExist("default_url"))
-        default_url = ini.Get("default_url");
-    if(ini.ItemExist("insert_url"))
-        insert_url = ini.Get("insert_url");
+    ini.GetBoolIfExist("api_mode", gAPIMode);
+    ini.GetIfExist("api_access_token", gAccessToken);
+    ini.GetIfExist("default_url", gDefaultUrls);
+    gEnableInsert = ini.Get("enable_insert");
+    ini.GetIfExist("insert_url", gInsertUrls);
+    ini.GetBoolIfExist("prepend_insert_url", gPrependInsert);
     if(ini.ItemPrefixExist("exclude_remarks"))
-        ini.GetAll("exclude_remarks", def_exclude_remarks);
+        ini.GetAll("exclude_remarks", gExcludeRemarks);
     if(ini.ItemPrefixExist("include_remarks"))
-        ini.GetAll("include_remarks", def_include_remarks);
-    if(ini.ItemExist("clash_rule_base"))
-        clash_rule_base = ini.Get("clash_rule_base");
-    if(ini.ItemExist("surge_rule_base"))
-        surge_rule_base = ini.Get("surge_rule_base");
-    if(ini.ItemExist("surfboard_rule_base"))
-        surfboard_rule_base = ini.Get("surfboard_rule_base");
-    if(ini.ItemExist("mellow_rule_base"))
-        mellow_rule_base = ini.Get("mellow_rule_base");
-    if(ini.ItemExist("quan_rule_base"))
-        quan_rule_base = ini.Get("quan_rule_base");
-    if(ini.ItemExist("quanx_rule_base"))
-        quanx_rule_base = ini.Get("quanx_rule_base");
-    if(ini.ItemExist("loon_rule_base"))
-        loon_rule_base = ini.Get("loon_rule_base");
-    if(ini.ItemExist("append_proxy_type"))
-        append_proxy_type = ini.GetBool("append_proxy_type");
-    if(ini.ItemExist("proxy_config"))
-        proxy_config = ini.Get("proxy_config");
-    if(ini.ItemExist("proxy_ruleset"))
-        proxy_ruleset = ini.Get("proxy_ruleset");
-    if(ini.ItemExist("proxy_subscription"))
-        proxy_subscription = ini.Get("proxy_subscription");
+        ini.GetAll("include_remarks", gIncludeRemarks);
+    gFilterScript = ini.GetBool("enable_filter") ? ini.Get("filter_script"): "";
+    ini.GetIfExist("base_path", gBasePath);
+    ini.GetIfExist("clash_rule_base", gClashBase);
+    ini.GetIfExist("surge_rule_base", gSurgeBase);
+    ini.GetIfExist("surfboard_rule_base", gSurfboardBase);
+    ini.GetIfExist("mellow_rule_base", gMellowBase);
+    ini.GetIfExist("quan_rule_base", gQuanBase);
+    ini.GetIfExist("quanx_rule_base", gQuanXBase);
+    ini.GetIfExist("loon_rule_base", gLoonBase);
+    ini.GetIfExist("default_external_config", gDefaultExtConfig);
+    ini.GetBoolIfExist("append_proxy_type", gAppendType);
+    ini.GetIfExist("proxy_config", gProxyConfig);
+    ini.GetIfExist("proxy_ruleset", gProxyRuleset);
+    ini.GetIfExist("proxy_subscription", gProxySubscription);
 
     if(ini.SectionExist("surge_external_proxy"))
     {
         ini.EnterSection("surge_external_proxy");
-        if(ini.ItemExist("surge_ssr_path"))
-            surge_ssr_path = ini.Get("surge_ssr_path");
+        ini.GetIfExist("surge_ssr_path", gSurgeSSRPath);
+        ini.GetBoolIfExist("resolve_hostname", gSurgeResolveHostname);
     }
 
     if(ini.SectionExist("node_pref"))
     {
         ini.EnterSection("node_pref");
-        if(ini.ItemExist("udp_flag"))
-            udp_flag = ini.GetBool("udp_flag");
-        if(ini.ItemExist("tcp_fast_open_flag"))
-            tfo_flag = ini.GetBool("tcp_fast_open_flag");
-        if(ini.ItemExist("sort_flag"))
-            do_sort = ini.GetBool("sort_flag");
-        if(ini.ItemExist("skip_cert_verify_flag"))
-            scv_flag = ini.GetBool("skip_cert_verify_flag");
-        if(ini.ItemExist("filter_deprecated_nodes"))
-            filter_deprecated = ini.GetBool("filter_deprecated_nodes");
-        if(ini.ItemExist("append_sub_userinfo"))
-            append_userinfo = ini.GetBool("append_sub_userinfo");
+        /*
+        ini.GetBoolIfExist("udp_flag", udp_flag);
+        ini.GetBoolIfExist("tcp_fast_open_flag", tfo_flag);
+        ini.GetBoolIfExist("skip_cert_verify_flag", scv_flag);
+        */
+        gUDP.set(ini.Get("udp_flag"));
+        gTFO.set(ini.Get("tcp_fast_open_flag"));
+        gSkipCertVerify.set(ini.Get("skip_cert_verify_flag"));
+        gTLS13.set(ini.Get("tls13_flag"));
+        ini.GetBoolIfExist("sort_flag", gEnableSort);
+        gSortScript = ini.Get("sort_script");
+        ini.GetBoolIfExist("filter_deprecated_nodes", gFilterDeprecated);
+        ini.GetBoolIfExist("append_sub_userinfo", gAppendUserinfo);
+        ini.GetBoolIfExist("clash_use_new_field_name", gClashUseNewField);
+        ini.GetIfExist("clash_proxies_style", gClashProxiesStyle);
         if(ini.ItemPrefixExist("rename_node"))
         {
             ini.GetAll("rename_node", tempArray);
-            importItems(tempArray);
+            importItems(tempArray, false);
             safe_set_renames(tempArray);
             eraseElements(tempArray);
         }
@@ -627,102 +1001,155 @@ void readConf()
         if(ini.ItemPrefixExist("stream_rule"))
         {
             ini.GetAll("stream_rule", tempArray);
-            importItems(tempArray);
+            importItems(tempArray, false);
             safe_set_streams(tempArray);
             eraseElements(tempArray);
         }
         if(ini.ItemPrefixExist("time_rule"))
         {
             ini.GetAll("time_rule", tempArray);
-            importItems(tempArray);
+            importItems(tempArray, false);
             safe_set_times(tempArray);
             eraseElements(tempArray);
         }
     }
 
     ini.EnterSection("managed_config");
-    if(ini.ItemExist("write_managed_config"))
-        write_managed_config = ini.GetBool("write_managed_config");
-    if(ini.ItemExist("managed_config_prefix"))
-        managed_config_prefix = ini.Get("managed_config_prefix");
-    if(ini.ItemExist("config_update_interval"))
-        config_update_interval = ini.GetInt("config_update_interval");
-    if(ini.ItemExist("config_update_strict"))
-        config_update_strict = ini.GetBool("config_update_strict");
-    if(ini.ItemExist("quanx_device_id"))
-        quanx_script_id = ini.Get("quanx_device_id");
+    ini.GetBoolIfExist("write_managed_config", gWriteManagedConfig);
+    ini.GetIfExist("managed_config_prefix", gManagedConfigPrefix);
+    ini.GetIntIfExist("config_update_interval", gUpdateInterval);
+    ini.GetBoolIfExist("config_update_strict", gUpdateStrict);
+    ini.GetIfExist("quanx_device_id", gQuanXDevID);
 
     ini.EnterSection("emojis");
-    if(ini.ItemExist("add_emoji"))
-        add_emoji = ini.GetBool("add_emoji");
-    if(ini.ItemExist("remove_old_emoji"))
-        remove_old_emoji = ini.GetBool("remove_old_emoji");
+    ini.GetBoolIfExist("add_emoji", gAddEmoji);
+    ini.GetBoolIfExist("remove_old_emoji", gRemoveEmoji);
     if(ini.ItemPrefixExist("rule"))
     {
         ini.GetAll("rule", tempArray);
-        importItems(tempArray);
+        importItems(tempArray, false);
         safe_set_emojis(tempArray);
         eraseElements(tempArray);
     }
 
-    ini.EnterSection("ruleset");
-    enable_rule_generator = ini.GetBool("enabled");
-    if(enable_rule_generator)
+    if(ini.SectionExist("rulesets"))
+        ini.EnterSection("rulesets");
+    else
+        ini.EnterSection("ruleset");
+    gEnableRuleGen = ini.GetBool("enabled");
+    if(gEnableRuleGen)
     {
-        if(ini.ItemExist("overwrite_original_rules"))
-            overwrite_original_rules = ini.GetBool("overwrite_original_rules");
-        if(ini.ItemExist("update_ruleset_on_request"))
-            update_ruleset_on_request = ini.GetBool("update_ruleset_on_request");
-        if(ini.ItemPrefixExist("surge_ruleset"))
+        ini.GetBoolIfExist("overwrite_original_rules", gOverwriteOriginalRules);
+        ini.GetBoolIfExist("update_ruleset_on_request", gUpdateRulesetOnRequest);
+        if(ini.ItemPrefixExist("ruleset"))
         {
-            ini.GetAll("surge_ruleset", rulesets);
-            importItems(rulesets);
+            ini.GetAll("ruleset", gCustomRulesets);
+            importItems(gCustomRulesets, true);
+        }
+        else if(ini.ItemPrefixExist("surge_ruleset"))
+        {
+            ini.GetAll("surge_ruleset", gCustomRulesets);
+            importItems(gCustomRulesets, false);
         }
     }
     else
     {
-        overwrite_original_rules = false;
-        update_ruleset_on_request = false;
+        gOverwriteOriginalRules = false;
+        gUpdateRulesetOnRequest = false;
     }
 
-    ini.EnterSection("clash_proxy_group");
+    if(ini.SectionExist("proxy_groups"))
+        ini.EnterSection("proxy_groups");
+    else
+        ini.EnterSection("clash_proxy_group");
     if(ini.ItemPrefixExist("custom_proxy_group"))
     {
-        ini.GetAll("custom_proxy_group", clash_extra_group);
-        importItems(clash_extra_group);
+        ini.GetAll("custom_proxy_group", gCustomProxyGroups);
+        importItems(gCustomProxyGroups, false);
+    }
+
+    ini.EnterSection("template");
+    ini.GetIfExist("template_path", gTemplatePath);
+    string_multimap tempmap;
+    ini.GetItems(tempmap);
+    eraseElements(gTemplateVars);
+    for(auto &x : tempmap)
+    {
+        if(x.first == "template_path")
+            continue;
+        gTemplateVars[x.first] = x.second;
+    }
+    gTemplateVars["managed_config_prefix"] = gManagedConfigPrefix;
+
+    if(ini.SectionExist("aliases"))
+    {
+        ini.EnterSection("aliases");
+        ini.GetItems(tempmap);
+        reset_redirect();
+        for(auto &x : tempmap)
+            append_redirect(x.first, x.second);
     }
 
     ini.EnterSection("server");
-    if(ini.ItemExist("listen"))
-        listen_address = ini.Get("listen");
-    if(ini.ItemExist("port"))
-        listen_port = ini.GetInt("port");
+    ini.GetIfExist("listen", gListenAddress);
+    ini.GetIntIfExist("port", gListenPort);
+    gServeFileRoot = ini.Get("serve_file_root");
+    gServeFile = !gServeFileRoot.empty();
 
     ini.EnterSection("advanced");
-    if(ini.ItemExist("print_debug_info"))
-        print_debug_info = ini.GetBool("print_debug_info");
-    if(ini.ItemExist("max_pending_connections"))
-        max_pending_connections = ini.GetInt("max_pending_connections");
-    if(ini.ItemExist("max_concurrent_threads"))
-        max_concurrent_threads = ini.GetInt("max_concurrent_threads");
-    if(ini.ItemExist("enable_base_gen"))
-        enable_base_gen = ini.GetBool("enable_base_gen");
+    std::string log_level;
+    ini.GetIfExist("log_level", log_level);
+    ini.GetBoolIfExist("print_debug_info", gPrintDbgInfo);
+    if(gPrintDbgInfo)
+        gLogLevel = LOG_LEVEL_VERBOSE;
+    else
+    {
+        switch(hash_(log_level))
+        {
+        case "warn"_hash:
+            gLogLevel = LOG_LEVEL_WARNING;
+            break;
+        case "error"_hash:
+            gLogLevel = LOG_LEVEL_ERROR;
+            break;
+        case "fatal"_hash:
+            gLogLevel = LOG_LEVEL_FATAL;
+            break;
+        case "verbose"_hash:
+            gLogLevel = LOG_LEVEL_VERBOSE;
+            break;
+        case "debug"_hash:
+            gLogLevel = LOG_LEVEL_DEBUG;
+            break;
+        default:
+            gLogLevel = LOG_LEVEL_INFO;
+        }
+    }
+    ini.GetIntIfExist("max_pending_connections", gMaxPendingConns);
+    ini.GetIntIfExist("max_concurrent_threads", gMaxConcurThreads);
+    ini.GetNumberIfExist("max_allowed_rulesets", gMaxAllowedRulesets);
+    ini.GetNumberIfExist("max_allowed_rules", gMaxAllowedRules);
+    ini.GetNumberIfExist("max_allowed_download_size", gMaxAllowedDownloadSize);
     if(ini.ItemExist("enable_cache"))
     {
         if(ini.GetBool("enable_cache"))
         {
-            if(ini.ItemExist("cache_subscription"))
-                cache_subscription = ini.GetInt("cache_subscription");
-            if(ini.ItemExist("cache_config"))
-                cache_config = ini.GetInt("cache_config");
-            if(ini.ItemExist("cache_ruleset"))
-                cache_ruleset = ini.GetInt("cache_ruleset");
+            ini.GetIntIfExist("cache_subscription", gCacheSubscription);
+            ini.GetIntIfExist("cache_config", gCacheConfig);
+            ini.GetIntIfExist("cache_ruleset", gCacheRuleset);
+            ini.GetBoolIfExist("serve_cache_on_fetch_fail", gServeCacheOnFetchFail);
         }
         else
-            cache_subscription = cache_config = cache_ruleset = 0; //disable cache
+        {
+            gCacheSubscription = gCacheConfig = gCacheRuleset = 0; //disable cache
+            gServeCacheOnFetchFail = false;
+        }
     }
+    ini.GetBoolIfExist("async_fetch_ruleset", gAsyncFetchRuleset);
+    ini.GetBoolIfExist("skip_failed_links", gSkipFailedLinks);
 
-    std::cerr<<"Read preference settings completed."<<std::endl;
+    //std::cerr<<"Read preference settings completed."<<std::endl;
+    writeLog(0, "Read preference settings completed.", LOG_LEVEL_INFO);
 }
 
 struct ExternalConfig
@@ -736,12 +1163,16 @@ struct ExternalConfig
     std::string quan_rule_base;
     std::string quanx_rule_base;
     std::string loon_rule_base;
+    std::string sssub_rule_base;
     string_array rename;
     string_array emoji;
     string_array include;
     string_array exclude;
+    template_args *tpl_args = NULL;
     bool overwrite_original_rules = false;
     bool enable_rule_generator = true;
+    tribool add_emoji;
+    tribool remove_old_emoji;
 };
 
 int loadExternalYAML(YAML::Node &node, ExternalConfig &ext)
@@ -757,45 +1188,63 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext)
     section["quan_rule_base"] >> ext.quan_rule_base;
     section["quanx_rule_base"] >> ext.quanx_rule_base;
     section["loon_rule_base"] >> ext.loon_rule_base;
+    section["sssub_rule_base"] >> ext.sssub_rule_base;
 
-    ext.enable_rule_generator = section["enable_rule_generator"].as<bool>();
-    ext.overwrite_original_rules = section["overwrite_original_rules"].as<bool>();
+    section["enable_rule_generator"] >> ext.enable_rule_generator;
+    section["overwrite_original_rules"] >> ext.overwrite_original_rules;
 
-    if(section["custom_proxy_group"].size())
-        readGroup(section["custom_proxy_group"], ext.custom_proxy_group);
+    const char *group_name = section["proxy_groups"].IsDefined() ? "proxy_groups" : "custom_proxy_group";
+    if(section[group_name].size())
+        readGroup(section[group_name], ext.custom_proxy_group, gAPIMode);
 
-    if(section["surge_ruleset"].size())
-        readRuleset(section["surge_ruleset"], ext.surge_ruleset);
+    const char *ruleset_name = section["rulesets"].IsDefined() ? "rulesets" : "surge_ruleset";
+    if(section[ruleset_name].size())
+    {
+        readRuleset(section[ruleset_name], ext.surge_ruleset, gAPIMode);
+        if(gMaxAllowedRulesets && ext.surge_ruleset.size() > gMaxAllowedRulesets)
+        {
+            writeLog(0, "Ruleset count in external config has exceeded limit.", LOG_LEVEL_WARNING);
+            eraseElements(ext.surge_ruleset);
+            return -1;
+        }
+    }
 
     if(section["rename_node"].size())
-        readRegexMatch(section["rename_node"], "@", ext.rename);
+        readRegexMatch(section["rename_node"], "@", ext.rename, gAPIMode);
+
+    ext.add_emoji = safe_as<std::string>(section["add_emoji"]);
+    ext.remove_old_emoji = safe_as<std::string>(section["remove_old_emoji"]);
+    const char *emoji_name = section["emojis"].IsDefined() ? "emojis" : "emoji";
+    if(section[emoji_name].size())
+        readEmoji(section[emoji_name], ext.emoji, gAPIMode);
 
     section["include_remarks"] >> ext.include;
     section["exclude_remarks"] >> ext.exclude;
+
+    if(node["template_args"].IsSequence() && ext.tpl_args != NULL)
+    {
+        std::string key, value;
+        for(size_t i = 0; i < node["template_args"].size(); i++)
+        {
+            node["template_args"][i]["key"] >> key;
+            node["template_args"][i]["value"] >> value;
+            ext.tpl_args->local_vars[key] = value;
+        }
+    }
 
     return 0;
 }
 
 int loadExternalConfig(std::string &path, ExternalConfig &ext)
 {
-    std::string base_content, dummy;
-    std::string proxy;
-    if(proxy_config == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_config == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_config;
-
-    if(fileExist(path))
-        base_content = fileGet(path, api_mode);
-    else
-        base_content = webGet(path, proxy, dummy, cache_config);
+    std::string base_content, proxy = parseProxy(gProxyConfig), config = fetchFile(path, proxy, gCacheConfig);
+    if(render_template(config, *ext.tpl_args, base_content, gTemplatePath) != 0)
+        base_content = config;
 
     try
     {
         YAML::Node yaml = YAML::Load(base_content);
-        if(yaml.size() && yaml["custom"])
+        if(yaml.size() && yaml["custom"].IsDefined())
             return loadExternalYAML(yaml, ext);
     }
     catch (YAML::Exception &e)
@@ -808,7 +1257,8 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext)
     ini.SetIsolatedItemsSection("custom");
     if(ini.Parse(base_content) != INIREADER_EXCEPTION_NONE)
     {
-        std::cerr<<"Load external configuration failed. Reason: "<<ini.GetLastError()<<"\n";
+        //std::cerr<<"Load external configuration failed. Reason: "<<ini.GetLastError()<<"\n";
+        writeLog(0, "Load external configuration failed. Reason: " + ini.GetLastError(), LOG_LEVEL_ERROR);
         return -1;
     }
 
@@ -816,509 +1266,595 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext)
     if(ini.ItemPrefixExist("custom_proxy_group"))
     {
         ini.GetAll("custom_proxy_group", ext.custom_proxy_group);
-        importItems(ext.custom_proxy_group);
+        importItems(ext.custom_proxy_group, gAPIMode);
     }
-    if(ini.ItemPrefixExist("surge_ruleset"))
+    std::string ruleset_name = ini.ItemPrefixExist("ruleset") ? "ruleset" : "surge_ruleset";
+    if(ini.ItemPrefixExist(ruleset_name))
     {
-        ini.GetAll("surge_ruleset", ext.surge_ruleset);
-        importItems(ext.surge_ruleset);
+        ini.GetAll(ruleset_name, ext.surge_ruleset);
+        importItems(ext.surge_ruleset, gAPIMode);
+        if(gMaxAllowedRulesets && ext.surge_ruleset.size() > gMaxAllowedRulesets)
+        {
+            writeLog(0, "Ruleset count in external config has exceeded limit. ", LOG_LEVEL_WARNING);
+            eraseElements(ext.surge_ruleset);
+            return -1;
+        }
     }
 
-    if(ini.ItemExist("clash_rule_base"))
-        ext.clash_rule_base = ini.Get("clash_rule_base");
-    if(ini.ItemExist("surge_rule_base"))
-        ext.surge_rule_base = ini.Get("surge_rule_base");
-    if(ini.ItemExist("surfboard_rule_base"))
-        ext.surfboard_rule_base = ini.Get("surfboard_rule_base");
-    if(ini.ItemExist("mellow_rule_base"))
-        ext.mellow_rule_base = ini.Get("mellow_rule_base");
-    if(ini.ItemExist("quan_rule_base"))
-        ext.quan_rule_base = ini.Get("quan_rule_base");
-    if(ini.ItemExist("quanx_rule_base"))
-        ext.quanx_rule_base = ini.Get("quanx_rule_base");
-    if(ini.ItemExist("loon_rule_base"))
-        ext.loon_rule_base = ini.Get("loon_rule_base");
+    ini.GetIfExist("clash_rule_base", ext.clash_rule_base);
+    ini.GetIfExist("surge_rule_base", ext.surge_rule_base);
+    ini.GetIfExist("surfboard_rule_base", ext.surfboard_rule_base);
+    ini.GetIfExist("mellow_rule_base", ext.mellow_rule_base);
+    ini.GetIfExist("quan_rule_base", ext.quan_rule_base);
+    ini.GetIfExist("quanx_rule_base", ext.quanx_rule_base);
+    ini.GetIfExist("loon_rule_base", ext.loon_rule_base);
+    ini.GetIfExist("sssub_rule_base", ext.sssub_rule_base);
 
-    if(ini.ItemExist("overwrite_original_rules"))
-        ext.overwrite_original_rules = ini.GetBool("overwrite_original_rules");
-    if(ini.ItemExist("enable_rule_generator"))
-        ext.enable_rule_generator = ini.GetBool("enable_rule_generator");
+    ini.GetBoolIfExist("overwrite_original_rules", ext.overwrite_original_rules);
+    ini.GetBoolIfExist("enable_rule_generator", ext.enable_rule_generator);
 
     if(ini.ItemPrefixExist("rename"))
     {
         ini.GetAll("rename", ext.rename);
-        importItems(ext.rename);
+        importItems(ext.rename, gAPIMode);
     }
+    ext.add_emoji = ini.Get("add_emoji");
+    ext.remove_old_emoji = ini.Get("remove_old_emoji");
     if(ini.ItemPrefixExist("emoji"))
     {
         ini.GetAll("emoji", ext.emoji);
-        importItems(ext.emoji);
+        importItems(ext.emoji, gAPIMode);
     }
     if(ini.ItemPrefixExist("include_remarks"))
         ini.GetAll("include_remarks", ext.include);
     if(ini.ItemPrefixExist("exclude_remarks"))
         ini.GetAll("exclude_remarks", ext.exclude);
 
+    if(ini.SectionExist("template") && ext.tpl_args != NULL)
+    {
+        ini.EnterSection("template");
+        string_multimap tempmap;
+        ini.GetItems(tempmap);
+        for(auto &x : tempmap)
+            ext.tpl_args->local_vars[x.first] = x.second;
+    }
+
     return 0;
 }
 
-void generateBase()
+void checkExternalBase(const std::string &path, std::string &dest)
 {
-    if(!enable_base_gen)
-        return;
-    std::string base_content;
-    std::cerr<<"Generating base content for Clash/R...\n";
-    if(fileExist(clash_rule_base))
-        base_content = fileGet(clash_rule_base);
-    else
-        base_content = webGet(clash_rule_base, getSystemProxy());
-    try
-    {
-        clash_base = YAML::Load(base_content);
-        rulesetToClash(clash_base, ruleset_content_array, overwrite_original_rules);
-    }
-    catch (YAML::Exception &e)
-    {
-        std::cerr<<"Unable to load Clash base content. Reason: "<<e.msg<<"\n";
-    }
-    // mellow base generate removed for now
-    /*
-    std::cerr<<"Generating base content for Mellow...\n";
-    if(fileExist(mellow_rule_base))
-        base_content = fileGet(mellow_rule_base);
-    else
-        base_content = webGet(mellow_rule_base, getSystemProxy());
-    mellow_base.keep_empty_section = true;
-    mellow_base.store_any_line = true;
-    if(mellow_base.Parse(base_content) != INIREADER_EXCEPTION_NONE)
-        std::cerr<<"Unable to load Mellow base content. Reason: "<<mellow_base.GetLastError()<<"\n";
-    else
-        rulesetToSurge(mellow_base, ruleset_content_array, 0, overwrite_original_rules, std::string());
-    */
+    if(isLink(path) || (startsWith(path, gBasePath) && fileExist(path)))
+        dest = path;
 }
 
 std::string subconverter(RESPONSE_CALLBACK_ARGS)
 {
-    std::string target = getUrlArg(argument, "target"), url = UrlDecode(getUrlArg(argument, "url")), emoji = getUrlArg(argument, "emoji");
-    std::string group = UrlDecode(getUrlArg(argument, "group")), upload = getUrlArg(argument, "upload"), upload_path = getUrlArg(argument, "upload_path"), version = getUrlArg(argument, "ver");
-    std::string append_type = getUrlArg(argument, "append_type"), tfo = getUrlArg(argument, "tfo"), udp = getUrlArg(argument, "udp"), nodelist = getUrlArg(argument, "list");
-    std::string include = UrlDecode(getUrlArg(argument, "include")), exclude = UrlDecode(getUrlArg(argument, "exclude")), sort_flag = getUrlArg(argument, "sort");
-    std::string scv = getUrlArg(argument, "scv"), fdn = getUrlArg(argument, "fdn"), expand = getUrlArg(argument, "expand"), append_sub_userinfo = getUrlArg(argument, "append_info");
-    std::string dev_id = getUrlArg(argument, "dev_id"), filename = getUrlArg(argument, "filename"), interval_str = getUrlArg(argument, "interval"), strict_str = getUrlArg(argument, "strict");
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
+
+    std::string argTarget = getUrlArg(argument, "target"), argSurgeVer = getUrlArg(argument, "ver");
+    tribool argClashNewField = getUrlArg(argument, "new_name");
+    int intSurgeVer = argSurgeVer.size() ? to_int(argSurgeVer, 3) : 3;
+    if(argTarget == "auto")
+        matchUserAgent(request.headers["User-Agent"], argTarget, argClashNewField, intSurgeVer);
+
+    /// don't try to load groups or rulesets when generating simple subscriptions
+    bool lSimpleSubscription = false;
+    switch(hash_(argTarget))
+    {
+    case "ss"_hash: case "ssd"_hash: case "ssr"_hash: case "sssub"_hash: case "v2ray"_hash: case "trojan"_hash: case "mixed"_hash:
+        lSimpleSubscription = true;
+        break;
+    case "clash"_hash: case "clashr"_hash: case "surge"_hash: case "quan"_hash: case "quanx"_hash: case "loon"_hash: case "surfboard"_hash: case "mellow"_hash:
+        break;
+    default:
+        *status_code = 400;
+        return "Invalid target!";
+    }
+    //check if we need to read configuration
+    if((!gAPIMode || gCFWChildProcess) && !gGeneratorMode)
+        readConf();
+
+    /// string values
+    std::string argUrl = UrlDecode(getUrlArg(argument, "url"));
+    std::string argGroupName = UrlDecode(getUrlArg(argument, "group")), argUploadPath = getUrlArg(argument, "upload_path");
+    std::string argIncludeRemark = UrlDecode(getUrlArg(argument, "include")), argExcludeRemark = UrlDecode(getUrlArg(argument, "exclude"));
+    std::string argCustomGroups = urlsafe_base64_decode(getUrlArg(argument, "groups")), argCustomRulesets = urlsafe_base64_decode(getUrlArg(argument, "ruleset")), argExternalConfig = UrlDecode(getUrlArg(argument, "config"));
+    std::string argDeviceID = getUrlArg(argument, "dev_id"), argFilename = getUrlArg(argument, "filename"), argUpdateInterval = getUrlArg(argument, "interval"), argUpdateStrict = getUrlArg(argument, "strict");
+    std::string argRenames = UrlDecode(getUrlArg(argument, "rename")), argFilterScript = UrlDecode(getUrlArg(argument, "filter_script"));
+
+    /// switches with default value
+    tribool argUpload = getUrlArg(argument, "upload"), argEmoji = getUrlArg(argument, "emoji"), argAddEmoji = getUrlArg(argument, "add_emoji"), argRemoveEmoji = getUrlArg(argument, "remove_emoji");
+    tribool argAppendType = getUrlArg(argument, "append_type"), argTFO = getUrlArg(argument, "tfo"), argUDP = getUrlArg(argument, "udp"), argGenNodeList = getUrlArg(argument, "list");
+    tribool argSort = getUrlArg(argument, "sort"), argUseSortScript = getUrlArg(argument, "sort_script");
+    tribool argGenClashScript = getUrlArg(argument, "script"), argEnableInsert = getUrlArg(argument, "insert");
+    tribool argSkipCertVerify = getUrlArg(argument, "scv"), argFilterDeprecated = getUrlArg(argument, "fdn"), argExpandRulesets = getUrlArg(argument, "expand"), argAppendUserinfo = getUrlArg(argument, "append_info");
+    tribool argPrependInsert = getUrlArg(argument, "prepend"), argGenClassicalRuleProvider = getUrlArg(argument, "classic"), argTLS13 = getUrlArg(argument, "tls13");
+
     std::string base_content, output_content;
-    string_array extra_group, extra_ruleset, include_remarks, exclude_remarks;
-    std::string groups = urlsafe_base64_decode(getUrlArg(argument, "groups")), ruleset = urlsafe_base64_decode(getUrlArg(argument, "ruleset")), config = UrlDecode(getUrlArg(argument, "config"));
-    std::vector<ruleset_content> rca;
+    string_array lCustomProxyGroups = gCustomProxyGroups, lCustomRulesets = gCustomRulesets, lIncludeRemarks = gIncludeRemarks, lExcludeRemarks = gExcludeRemarks;
+    std::vector<ruleset_content> lRulesetContent;
     extra_settings ext;
     std::string subInfo, dummy;
-    int interval = interval_str.size() ? to_int(interval_str, config_update_interval) : config_update_interval;
-    bool ruleset_updated = false, authorized = !api_mode || getUrlArg(argument, "token") == access_token, strict = strict_str.size() ? strict_str == "true" : config_update_strict;
+    int interval = argUpdateInterval.size() ? to_int(argUpdateInterval, gUpdateInterval) : gUpdateInterval;
+    bool authorized = !gAPIMode || getUrlArg(argument, "token") == gAccessToken, strict = argUpdateStrict.size() ? argUpdateStrict == "true" : gUpdateStrict;
 
-    if(std::find(regex_blacklist.cbegin(), regex_blacklist.cend(), include) != regex_blacklist.cend() || std::find(regex_blacklist.cbegin(), regex_blacklist.cend(), exclude) != regex_blacklist.cend())
+    if(std::find(gRegexBlacklist.cbegin(), gRegexBlacklist.cend(), argIncludeRemark) != gRegexBlacklist.cend() || std::find(gRegexBlacklist.cbegin(), gRegexBlacklist.cend(), argExcludeRemark) != gRegexBlacklist.cend())
         return "Invalid request!";
 
-    //for external configuration
-    std::string ext_clash_base = clash_rule_base, ext_surge_base = surge_rule_base, ext_mellow_base = mellow_rule_base, ext_surfboard_base = surfboard_rule_base;
-    std::string ext_quan_base = quan_rule_base, ext_quanx_base = quanx_rule_base, ext_loon_base = loon_rule_base;
+    /// for external configuration
+    std::string lClashBase = gClashBase, lSurgeBase = gSurgeBase, lMellowBase = gMellowBase, lSurfboardBase = gSurfboardBase;
+    std::string lQuanBase = gQuanBase, lQuanXBase = gQuanXBase, lLoonBase = gLoonBase, lSSSubBase = gSSSubBase;
 
-    //validate urls
-    if(!url.size() && (!api_mode || authorized))
-        url = default_url;
-    if(insert_url.size())
-        url = insert_url + "|" + url;
-    if(!url.size() || !target.size())
+    /// validate urls
+    argEnableInsert.define(gEnableInsert);
+    if(!argUrl.size() && (!gAPIMode || authorized))
+        argUrl = gDefaultUrls;
+    if((!argUrl.size() && !(gInsertUrls.size() && argEnableInsert)) || !argTarget.size())
     {
         *status_code = 400;
         return "Invalid request!";
     }
 
-    //check if we need to read configuration
-    if((!api_mode || cfw_child_process) && !generator_mode)
-        readConf();
-
-    //check for proxy settings
-    std::string proxy;
-    if(proxy_subscription == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_subscription == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_subscription;
-
-    ext.emoji_array = safe_get_emojis();
-    ext.rename_array = safe_get_renames();
-
-    //check other flags
-    if(emoji.size())
+    /// load request arguments as template variables
+    string_array req_args = split(argument, "&");
+    string_map req_arg_map;
+    for(std::string &x : req_args)
     {
-        ext.add_emoji = emoji == "true";
-        ext.remove_emoji = true;
+        string_size pos = x.find("=");
+        if(pos == x.npos)
+        {
+            req_arg_map[x] = "";
+            continue;
+        }
+        if(x.substr(0, pos) == "token")
+            continue;
+        req_arg_map[x.substr(0, pos)] = x.substr(pos + 1);
     }
-    else
-    {
-        ext.add_emoji = add_emoji;
-        ext.remove_emoji = remove_old_emoji;
-    }
-    if(append_type.size())
-        ext.append_proxy_type = append_type == "true";
-    else
-        ext.append_proxy_type = append_proxy_type;
 
-    ext.tfo = tfo.size() ? tfo == "true" : tfo_flag;
-    ext.udp = udp.size() ? udp == "true" : udp_flag;
-    ext.sort_flag = sort_flag.size() ? sort_flag == "true" : do_sort;
-    ext.skip_cert_verify = scv.size() ? scv == "true" : scv_flag;
-    ext.filter_deprecated = fdn.size() ? fdn == "true" : filter_deprecated;
+    /// save template variables
+    template_args tpl_args;
+    tpl_args.global_vars = gTemplateVars;
+    tpl_args.request_params = req_arg_map;
 
-    ext.nodelist = nodelist == "true";
-    ext.surge_ssr_path = surge_ssr_path;
-    ext.quanx_dev_id = dev_id.size() ? dev_id : quanx_script_id;
-    ext.enable_rule_generator = enable_rule_generator;
-    ext.overwrite_original_rules = overwrite_original_rules;
-    if(expand != "true")
-        ext.managed_config_prefix = managed_config_prefix;
+    /// check for proxy settings
+    std::string proxy = parseProxy(gProxySubscription);
+
+    /// check other flags
+    ext.append_proxy_type = argAppendType.get(gAppendType);
+    if((argTarget == "clash" || argTarget == "clashr") && argGenClashScript.is_undef())
+        argExpandRulesets.define(true);
+
+    ext.clash_proxies_style = gClashProxiesStyle;
+
+    /// read preference from argument, assign global var if not in argument
+    ext.tfo.parse(argTFO).parse(gTFO);
+    ext.udp.parse(argUDP).parse(gUDP);
+    ext.skip_cert_verify.parse(argSkipCertVerify).parse(gSkipCertVerify);
+    ext.tls13.parse(argTLS13).parse(gTLS13);
+
+    ext.sort_flag = argSort.get(gEnableSort);
+    argUseSortScript.define(gSortScript.size() != 0);
+    if(ext.sort_flag && argUseSortScript)
+        ext.sort_script = gSortScript;
+    ext.filter_deprecated = argFilterDeprecated.get(gFilterDeprecated);
+    ext.clash_new_field_name = argClashNewField.get(gClashUseNewField);
+    ext.clash_script = argGenClashScript.get();
+    ext.clash_classical_ruleset = argGenClassicalRuleProvider.get();
+    if(!argExpandRulesets)
+        ext.clash_new_field_name = true;
+    else
+        ext.clash_script = false;
+
+    ext.nodelist = argGenNodeList;
+    ext.surge_ssr_path = gSurgeSSRPath;
+    ext.quanx_dev_id = argDeviceID.size() ? argDeviceID : gQuanXDevID;
+    ext.enable_rule_generator = gEnableRuleGen;
+    ext.overwrite_original_rules = gOverwriteOriginalRules;
+    if(!argExpandRulesets)
+        ext.managed_config_prefix = gManagedConfigPrefix;
 
     //load external configuration
-    if(config.size())
+    if(argExternalConfig.empty())
+        argExternalConfig = gDefaultExtConfig;
+    if(argExternalConfig.size())
     {
-        std::cerr<<"External configuration file provided. Loading...\n";
-        //read predefined data first
-        extra_group = clash_extra_group;
-        extra_ruleset = rulesets;
-        //then load external configuration
+        //std::cerr<<"External configuration file provided. Loading...\n";
+        writeLog(0, "External configuration file provided. Loading...", LOG_LEVEL_INFO);
         ExternalConfig extconf;
-        loadExternalConfig(config, extconf);
-        if(extconf.clash_rule_base.size())
-            ext_clash_base = extconf.clash_rule_base;
-        if(extconf.surge_rule_base.size())
-            ext_surge_base = extconf.surge_rule_base;
-        if(extconf.surfboard_rule_base.size())
-            ext_surfboard_base = extconf.surfboard_rule_base;
-        if(extconf.mellow_rule_base.size())
-            ext_mellow_base = extconf.mellow_rule_base;
-        if(extconf.quan_rule_base.size())
-            ext_quan_base = extconf.quan_rule_base;
-        if(extconf.quanx_rule_base.size())
-            ext_quanx_base = extconf.quanx_rule_base;
-        if(extconf.loon_rule_base.size())
-            ext_loon_base = extconf.loon_rule_base;
-        if(extconf.rename.size())
-            ext.rename_array = extconf.rename;
-        if(extconf.emoji.size())
-            ext.emoji_array = extconf.emoji;
-        ext.enable_rule_generator = extconf.enable_rule_generator;
-        //load custom group
-        if(extconf.custom_proxy_group.size())
-            extra_group = extconf.custom_proxy_group;
-        //load custom rules
-        ext.overwrite_original_rules = extconf.overwrite_original_rules;
-        if(extconf.surge_ruleset.size() && !ext.nodelist)
+        extconf.tpl_args = &tpl_args;
+        if(loadExternalConfig(argExternalConfig, extconf) == 0)
         {
-            extra_ruleset = extconf.surge_ruleset;
-            refreshRulesets(extra_ruleset, rca);
-            ruleset_updated = true;
-        }
-        else
-        {
-            if(ext.enable_rule_generator && !ext.nodelist)
+            if(!ext.nodelist)
             {
-                if(update_ruleset_on_request)
-                    refreshRulesets(rulesets, ruleset_content_array);
-                rca = ruleset_content_array;
+                checkExternalBase(extconf.sssub_rule_base, lSSSubBase);
+                if(!lSimpleSubscription)
+                {
+                    checkExternalBase(extconf.clash_rule_base, lClashBase);
+                    checkExternalBase(extconf.surge_rule_base, lSurgeBase);
+                    checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase);
+                    checkExternalBase(extconf.mellow_rule_base, lMellowBase);
+                    checkExternalBase(extconf.quan_rule_base, lQuanBase);
+                    checkExternalBase(extconf.quanx_rule_base, lQuanXBase);
+                    checkExternalBase(extconf.loon_rule_base, lLoonBase);
+
+                    if(extconf.surge_ruleset.size())
+                        lCustomRulesets = extconf.surge_ruleset;
+                    if(extconf.custom_proxy_group.size())
+                        lCustomProxyGroups = extconf.custom_proxy_group;
+                    ext.enable_rule_generator = extconf.enable_rule_generator;
+                    ext.overwrite_original_rules = extconf.overwrite_original_rules;
+                }
             }
+            if(extconf.rename.size())
+                ext.rename_array = extconf.rename;
+            if(extconf.emoji.size())
+                ext.emoji_array = extconf.emoji;
+            if(extconf.include.size())
+                lIncludeRemarks = extconf.include;
+            if(extconf.exclude.size())
+                lExcludeRemarks = extconf.exclude;
+            argAddEmoji.define(extconf.add_emoji);
+            argRemoveEmoji.define(extconf.remove_old_emoji);
         }
-        if(extconf.include.size())
-            include_remarks = extconf.include;
-        if(extconf.exclude.size())
-            exclude_remarks = extconf.exclude;
+
     }
     else
     {
-        //loading custom groups
-        if(groups.size() && !ext.nodelist)
+        if(!lSimpleSubscription)
         {
-            extra_group = split(groups, "@");
-            if(!extra_group.size())
-                extra_group = clash_extra_group;
-        }
-        else
-            extra_group = clash_extra_group;
+            //loading custom groups
+            if(argCustomGroups.size() && !ext.nodelist)
+                lCustomProxyGroups = split(argCustomGroups, "@");
 
-        //loading custom rulesets
-        if(ruleset.size() && !ext.nodelist)
-        {
-            extra_ruleset = split(ruleset, "@");
-            if(!extra_ruleset.size())
-            {
-                if(update_ruleset_on_request)
-                    refreshRulesets(rulesets, ruleset_content_array);
-                rca = ruleset_content_array;
-            }
-            else
-            {
-                refreshRulesets(extra_ruleset, rca);
-                ruleset_updated = true;
-            }
+            //loading custom rulesets
+            if(argCustomRulesets.size() && !ext.nodelist)
+                lCustomRulesets = split(argCustomRulesets, "@");
         }
+    }
+    if(ext.enable_rule_generator && !ext.nodelist && !lSimpleSubscription)
+    {
+        if(lCustomRulesets != gCustomRulesets)
+            refreshRulesets(lCustomRulesets, lRulesetContent);
         else
         {
-            if(enable_rule_generator && !ext.nodelist)
-            {
-                if(update_ruleset_on_request || cfw_child_process)
-                    refreshRulesets(rulesets, ruleset_content_array);
-                rca = ruleset_content_array;
-            }
+            if(gUpdateRulesetOnRequest)
+                refreshRulesets(gCustomRulesets, gRulesetContent);
+            lRulesetContent = gRulesetContent;
         }
     }
 
-    //loading urls
-    string_array urls = split(url, "|");
-    std::vector<nodeInfo> nodes;
-    int groupID = 0;
+    if(!argEmoji.is_undef())
+    {
+        argAddEmoji.set(argEmoji);
+        argRemoveEmoji.set(true);
+    }
+    ext.add_emoji = argAddEmoji.get(gAddEmoji);
+    ext.remove_emoji = argRemoveEmoji.get(gRemoveEmoji);
+    if(ext.add_emoji && ext.emoji_array.empty())
+        ext.emoji_array = safe_get_emojis();
+    if(argRenames.size())
+        ext.rename_array = split(argRenames, "`");
+    else if(ext.rename_array.empty())
+        ext.rename_array = safe_get_renames();
 
     //check custom include/exclude settings
-    if(include.size() && regValid(include))
-        include_remarks.emplace_back(include);
-    else
-        include_remarks = def_include_remarks;
-    if(exclude.size() && regValid(exclude))
-        exclude_remarks.emplace_back(exclude);
-    else
-        exclude_remarks = def_exclude_remarks;
+    if(argIncludeRemark.size() && regValid(argIncludeRemark))
+        lIncludeRemarks = string_array{argIncludeRemark};
+    if(argExcludeRemark.size() && regValid(argExcludeRemark))
+        lExcludeRemarks = string_array{argExcludeRemark};
 
     //start parsing urls
     string_array stream_temp = safe_get_streams(), time_temp = safe_get_times();
+
+    //loading urls
+    string_array urls;
+    std::vector<nodeInfo> nodes, insert_nodes;
+    int groupID = 0;
+    if(gInsertUrls.size() && argEnableInsert)
+    {
+        groupID = -1;
+        urls = split(gInsertUrls, "|");
+        importItems(urls, true);
+        for(std::string &x : urls)
+        {
+            x = regTrim(x);
+            writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+            if(addNodes(x, insert_nodes, groupID, proxy, lExcludeRemarks, lIncludeRemarks, stream_temp, time_temp, subInfo, authorized, request.headers) == -1)
+            {
+                if(gSkipFailedLinks)
+                    writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
+                else
+                {
+                    *status_code = 400;
+                    return "The following link doesn't contain any valid node info: " + x;
+                }
+            }
+            groupID--;
+        }
+    }
+    urls = split(argUrl, "|");
+    importItems(urls, true);
+    groupID = 0;
     for(std::string &x : urls)
     {
-        x = trim(x);
-        std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-        if(addNodes(x, nodes, groupID, proxy, exclude_remarks, include_remarks, stream_temp, time_temp, subInfo, authorized) == -1)
+        x = regTrim(x);
+        //std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
+        writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+        if(addNodes(x, nodes, groupID, proxy, lExcludeRemarks, lIncludeRemarks, stream_temp, time_temp, subInfo, authorized, request.headers) == -1)
         {
-            *status_code = 400;
-            return std::string("The following link doesn't contain any valid node info: " + x);
+            if(gSkipFailedLinks)
+                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
+            else
+            {
+                *status_code = 400;
+                return "The following link doesn't contain any valid node info: " + x;
+            }
         }
         groupID++;
     }
     //exit if found nothing
-    if(!nodes.size())
+    if(!nodes.size() && !insert_nodes.size())
     {
         *status_code = 400;
         return "No nodes were found!";
     }
-
-    //check custom group name
-    if(group.size())
-        for(nodeInfo &x : nodes)
-            x.group = group;
-
-    if(subInfo.size() && (append_sub_userinfo.size() ? append_sub_userinfo == "true" : append_userinfo))
-        extra_headers.emplace("Subscription-UserInfo", subInfo);
-
-    string_array dummy_group;
-    std::vector<ruleset_content> dummy_ruleset;
-
-    std::cerr<<"Generate target: ";
-    if(target == "clash" || target == "clashr")
+    argPrependInsert.define(gPrependInsert);
+    if(argPrependInsert)
     {
-        std::cerr<<"Clash"<<((target == "clashr") ? "R" : "")<<std::endl;
-        if(ext.nodelist)
-        {
-            YAML::Node yamlnode;
-            netchToClash(nodes, yamlnode, dummy_group, target == "clashr", ext);
-            output_content = YAML::Dump(yamlnode);
-        }
-        else if(ruleset_updated || update_ruleset_on_request || ext_clash_base != clash_rule_base || !enable_base_gen)
-        {
-            if(fileExist(ext_clash_base))
-                base_content = fileGet(ext_clash_base);
-            else
-                base_content = webGet(ext_clash_base, getSystemProxy(), dummy, cache_config);
-
-            output_content = netchToClash(nodes, base_content, rca, extra_group, target == "clashr", ext);
-        }
-        else
-        {
-            YAML::Node yamlnode = safe_get_clash_base();
-            netchToClash(nodes, yamlnode, extra_group, target == "clashr", ext);
-            output_content = YAML::Dump(yamlnode);
-        }
-
-        if(upload == "true")
-            uploadGist(target, upload_path, output_content, false);
-    }
-    else if(target == "surge")
-    {
-        int surge_ver = version.size() ? to_int(version, 3) : 3;
-        std::cerr<<"Surge "<<surge_ver<<std::endl;
-
-        if(ext.nodelist)
-        {
-            output_content = netchToSurge(nodes, base_content, dummy_ruleset, dummy_group, surge_ver, ext);
-        }
-        else
-        {
-            if(fileExist(ext_surge_base))
-                base_content = fileGet(ext_surge_base);
-            else
-                base_content = webGet(ext_surge_base, getSystemProxy(), dummy, cache_config);
-
-            output_content = netchToSurge(nodes, base_content, rca, extra_group, surge_ver, ext);
-            if(upload == "true")
-                uploadGist("surge" + version, upload_path, output_content, true);
-
-            if(write_managed_config && managed_config_prefix.size())
-                output_content = "#!MANAGED-CONFIG " + managed_config_prefix + "/sub?" + argument + (interval ? " interval=" + std::to_string(interval) : "") \
-                 + " strict=" + std::string(strict ? "true" : "false") + "\n\n" + output_content;
-        }
-    }
-    else if(target == "surfboard")
-    {
-        std::cerr<<"Surfboard"<<std::endl;
-        if(fileExist(ext_surfboard_base))
-            base_content = fileGet(ext_surfboard_base);
-        else
-            base_content = webGet(ext_surfboard_base, getSystemProxy(), dummy, cache_config);
-
-        output_content = netchToSurge(nodes, base_content, rca, extra_group, -3, ext);
-        if(upload == "true")
-            uploadGist("surfboard", upload_path, output_content, true);
-
-        if(write_managed_config && managed_config_prefix.size())
-            output_content = "#!MANAGED-CONFIG " + managed_config_prefix + "/sub?" + argument + (interval ? " interval=" + std::to_string(interval) : "") \
-                 + " strict=" + std::string(strict ? "true" : "false") + "\n\n" + output_content;
-    }
-    else if(target == "mellow")
-    {
-        std::cerr<<"Mellow"<<std::endl;
-        // mellow base generator removed for now
-        //if(ruleset_updated || update_ruleset_on_request || ext_mellow_base != mellow_rule_base || !enable_base_gen)
-        {
-            if(fileExist(ext_mellow_base))
-                base_content = fileGet(ext_mellow_base);
-            else
-                base_content = webGet(ext_mellow_base, getSystemProxy(), dummy, cache_config);
-
-            output_content = netchToMellow(nodes, base_content, rca, extra_group, ext);
-        }
-        /*
-        else
-        {
-            INIReader ini;
-            ini = safe_get_mellow_base();
-            netchToMellow(nodes, ini, rca, extra_group, ext);
-            output_content = ini.ToString();
-        }
-        */
-
-        if(upload == "true")
-            uploadGist("mellow", upload_path, output_content, true);
-    }
-    else if(target == "ss")
-    {
-        std::cerr<<"SS"<<std::endl;
-        output_content = netchToSS(nodes, ext);
-        if(upload == "true")
-            uploadGist("ss", upload_path, output_content, false);
-        return output_content;
-    }
-    else if(target == "sssub")
-    {
-        std::cerr<<"SS Subscription"<<std::endl;
-        output_content = netchToSSSub(nodes, ext);
-        if(upload == "true")
-            uploadGist("sssub", upload_path, output_content, false);
-    }
-    else if(target == "ssr")
-    {
-        std::cerr<<"SSR"<<std::endl;
-        output_content = netchToSSR(nodes, ext);
-        if(upload == "true")
-            uploadGist("ssr", upload_path, output_content, false);
-    }
-    else if(target == "v2ray")
-    {
-        std::cerr<<"v2rayN"<<std::endl;
-        output_content = netchToVMess(nodes, ext);
-        if(upload == "true")
-            uploadGist("v2ray", upload_path, output_content, false);
-    }
-    else if(target == "quan")
-    {
-        std::cerr<<"Quantumult"<<std::endl;
-        if(!ext.nodelist)
-        {
-            if(fileExist(ext_quan_base))
-                base_content = fileGet(ext_quan_base);
-            else
-                base_content = webGet(ext_quan_base, getSystemProxy(), dummy, cache_config);
-        }
-
-        output_content = netchToQuan(nodes, base_content, rca, extra_group, ext);
-
-        if(upload == "true")
-            uploadGist("quan", upload_path, output_content, false);
-    }
-    else if(target == "quanx")
-    {
-        std::cerr<<"Quantumult X"<<std::endl;
-        if(!ext.nodelist)
-        {
-            if(fileExist(ext_quanx_base))
-                base_content = fileGet(ext_quanx_base);
-            else
-                base_content = webGet(ext_quanx_base, getSystemProxy(), dummy, cache_config);
-        }
-
-        output_content = netchToQuanX(nodes, base_content, rca, extra_group, ext);
-
-        if(upload == "true")
-            uploadGist("quanx", upload_path, output_content, false);
-    }
-    else if(target == "loon")
-    {
-        std::cerr<<"Loon"<<std::endl;
-        if(!ext.nodelist)
-        {
-            if(fileExist(ext_loon_base))
-                base_content = fileGet(ext_loon_base);
-            else
-                base_content = webGet(ext_loon_base, getSystemProxy(), dummy, cache_config);
-        }
-
-        output_content = netchToLoon(nodes, base_content, rca, extra_group, ext);
-
-        if(upload == "true")
-            uploadGist("loon", upload_path, output_content, false);
-    }
-    else if(target == "ssd")
-    {
-        std::cerr<<"SSD"<<std::endl;
-        output_content = netchToSSD(nodes, group, subInfo, ext);
-        if(upload == "true")
-            uploadGist("ssd", upload_path, output_content, false);
+        std::move(nodes.begin(), nodes.end(), std::back_inserter(insert_nodes));
+        nodes.swap(insert_nodes);
     }
     else
     {
-        std::cerr<<"Unspecified"<<std::endl;
+        std::move(insert_nodes.begin(), insert_nodes.end(), std::back_inserter(nodes));
+    }
+    //run filter script
+    std::string filterScript = gFilterScript;
+    if(authorized && !argFilterScript.empty())
+        filterScript = argFilterScript;
+    if(filterScript.size())
+    {
+        if(startsWith(filterScript, "path:"))
+            filterScript = fileGet(filterScript.substr(5), false);
+        duk_context *ctx = duktape_init();
+        if(ctx)
+        {
+            defer(duk_destroy_heap(ctx);)
+            if(duktape_peval(ctx, filterScript) == 0)
+            {
+                auto filter = [&](const nodeInfo &x)
+                {
+                    duk_get_global_string(ctx, "filter");
+                    duktape_push_nodeinfo(ctx, x);
+                    duk_pcall(ctx, 1);
+                    return !duktape_get_res_bool(ctx);
+                };
+                nodes.erase(std::remove_if(nodes.begin(), nodes.end(), filter), nodes.end());
+            }
+            else
+            {
+                writeLog(0, "Error when trying to parse script:\n" + duktape_get_err_stack(ctx), LOG_LEVEL_ERROR);
+                duk_pop(ctx); /// pop err
+            }
+        }
+    }
+
+    //check custom group name
+    if(argGroupName.size())
+        for(nodeInfo &x : nodes)
+            x.group = argGroupName;
+
+    if(subInfo.size() && argAppendUserinfo.get(gAppendUserinfo))
+        response.headers.emplace("Subscription-UserInfo", subInfo);
+
+    //do pre-process now
+    preprocessNodes(nodes, ext);
+
+    string_array dummy_group;
+    std::vector<ruleset_content> dummy_ruleset;
+    std::string managed_url = base64_decode(UrlDecode(getUrlArg(argument, "profile_data")));
+    if(managed_url.empty())
+        managed_url = gManagedConfigPrefix + "/sub?" + argument;
+
+    //std::cerr<<"Generate target: ";
+    proxy = parseProxy(gProxyConfig);
+    switch(hash_(argTarget))
+    {
+    case "clash"_hash: case "clashr"_hash:
+        writeLog(0, argTarget == "clashr" ? "Generate target: ClashR" : "Generate target: Clash", LOG_LEVEL_INFO);
+        tpl_args.local_vars["clash.new_field_name"] = ext.clash_new_field_name ? "true" : "false";
+        response.headers["profile-update-interval"] = std::to_string(interval / 3600);
+        if(ext.nodelist)
+        {
+            YAML::Node yamlnode;
+            netchToClash(nodes, yamlnode, dummy_group, argTarget == "clashr", ext);
+            output_content = YAML::Dump(yamlnode);
+        }
+        else
+        {
+            if(render_template(fetchFile(lClashBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+            {
+                *status_code = 400;
+                return base_content;
+            }
+            output_content = netchToClash(nodes, base_content, lRulesetContent, lCustomProxyGroups, argTarget == "clashr", ext);
+        }
+
+        if(argUpload)
+            uploadGist(argTarget, argUploadPath, output_content, false);
+        break;
+    case "surge"_hash:
+
+        writeLog(0, "Generate target: Surge " + std::to_string(intSurgeVer), LOG_LEVEL_INFO);
+
+        if(ext.nodelist)
+        {
+            output_content = netchToSurge(nodes, base_content, dummy_ruleset, dummy_group, intSurgeVer, ext);
+
+            if(argUpload)
+                uploadGist("surge" + argSurgeVer + "list", argUploadPath, output_content, true);
+        }
+        else
+        {
+            if(render_template(fetchFile(lSurgeBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+            {
+                *status_code = 400;
+                return base_content;
+            }
+            output_content = netchToSurge(nodes, base_content, lRulesetContent, lCustomProxyGroups, intSurgeVer, ext);
+
+            if(argUpload)
+                uploadGist("surge" + argSurgeVer, argUploadPath, output_content, true);
+
+            if(gWriteManagedConfig && gManagedConfigPrefix.size())
+                output_content = "#!MANAGED-CONFIG " + managed_url + (interval ? " interval=" + std::to_string(interval) : "") \
+                 + " strict=" + std::string(strict ? "true" : "false") + "\n\n" + output_content;
+        }
+        break;
+    case "surfboard"_hash:
+        writeLog(0, "Generate target: Surfboard", LOG_LEVEL_INFO);
+
+        if(render_template(fetchFile(lSurfboardBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+        {
+            *status_code = 400;
+            return base_content;
+        }
+        output_content = netchToSurge(nodes, base_content, lRulesetContent, lCustomProxyGroups, -3, ext);
+        if(argUpload)
+            uploadGist("surfboard", argUploadPath, output_content, true);
+
+        if(gWriteManagedConfig && gManagedConfigPrefix.size())
+            output_content = "#!MANAGED-CONFIG " + managed_url + (interval ? " interval=" + std::to_string(interval) : "") \
+                 + " strict=" + std::string(strict ? "true" : "false") + "\n\n" + output_content;
+        break;
+    case "mellow"_hash:
+        writeLog(0, "Generate target: Mellow", LOG_LEVEL_INFO);
+
+        if(render_template(fetchFile(lMellowBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+        {
+            *status_code = 400;
+            return base_content;
+        }
+        output_content = netchToMellow(nodes, base_content, lRulesetContent, lCustomProxyGroups, ext);
+
+        if(argUpload)
+            uploadGist("mellow", argUploadPath, output_content, true);
+        break;
+    case "sssub"_hash:
+        writeLog(0, "Generate target: SS Subscription", LOG_LEVEL_INFO);
+
+        if(render_template(fetchFile(lSSSubBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+        {
+            *status_code = 400;
+            return base_content;
+        }
+        output_content = netchToSSSub(base_content, nodes, ext);
+        if(argUpload)
+            uploadGist("sssub", argUploadPath, output_content, false);
+        break;
+    case "ss"_hash:
+        writeLog(0, "Generate target: SS", LOG_LEVEL_INFO);
+        output_content = netchToSingle(nodes, 1, ext);
+        if(argUpload)
+            uploadGist("ss", argUploadPath, output_content, false);
+        break;
+    case "ssr"_hash:
+        writeLog(0, "Generate target: SSR", LOG_LEVEL_INFO);
+        output_content = netchToSingle(nodes, 2, ext);
+        if(argUpload)
+            uploadGist("ssr", argUploadPath, output_content, false);
+        break;
+    case "v2ray"_hash:
+        writeLog(0, "Generate target: v2rayN", LOG_LEVEL_INFO);
+        output_content = netchToSingle(nodes, 4, ext);
+        if(argUpload)
+            uploadGist("v2ray", argUploadPath, output_content, false);
+        break;
+    case "trojan"_hash:
+        writeLog(0, "Generate target: Trojan", LOG_LEVEL_INFO);
+        output_content = netchToSingle(nodes, 8, ext);
+        if(argUpload)
+            uploadGist("trojan", argUploadPath, output_content, false);
+        break;
+    case "mixed"_hash:
+        writeLog(0, "Generate target: Standard Subscription", LOG_LEVEL_INFO);
+        output_content = netchToSingle(nodes, 15, ext);
+        if(argUpload)
+            uploadGist("sub", argUploadPath, output_content, false);
+        break;
+    case "quan"_hash:
+        writeLog(0, "Generate target: Quantumult", LOG_LEVEL_INFO);
+        if(!ext.nodelist)
+        {
+            if(render_template(fetchFile(lQuanBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+            {
+                *status_code = 400;
+                return base_content;
+            }
+        }
+
+        output_content = netchToQuan(nodes, base_content, lRulesetContent, lCustomProxyGroups, ext);
+
+        if(argUpload)
+            uploadGist("quan", argUploadPath, output_content, false);
+        break;
+    case "quanx"_hash:
+        writeLog(0, "Generate target: Quantumult X", LOG_LEVEL_INFO);
+        if(!ext.nodelist)
+        {
+            if(render_template(fetchFile(lQuanXBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+            {
+                *status_code = 400;
+                return base_content;
+            }
+        }
+
+        output_content = netchToQuanX(nodes, base_content, lRulesetContent, lCustomProxyGroups, ext);
+
+        if(argUpload)
+            uploadGist("quanx", argUploadPath, output_content, false);
+        break;
+    case "loon"_hash:
+        writeLog(0, "Generate target: Loon", LOG_LEVEL_INFO);
+        if(!ext.nodelist)
+        {
+            if(render_template(fetchFile(lLoonBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+            {
+                *status_code = 400;
+                return base_content;
+            }
+        }
+
+        output_content = netchToLoon(nodes, base_content, lRulesetContent, lCustomProxyGroups, ext);
+
+        if(argUpload)
+            uploadGist("loon", argUploadPath, output_content, false);
+        break;
+    case "ssd"_hash:
+        writeLog(0, "Generate target: SSD", LOG_LEVEL_INFO);
+        output_content = netchToSSD(nodes, argGroupName, subInfo, ext);
+        if(argUpload)
+            uploadGist("ssd", argUploadPath, output_content, false);
+        break;
+    default:
+        writeLog(0, "Generate target: Unspecified", LOG_LEVEL_INFO);
         *status_code = 500;
         return "Unrecognized target";
     }
-    if(filename.size())
-        extra_headers.emplace("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    writeLog(0, "Generate completed.", LOG_LEVEL_INFO);
+    if(argFilename.size())
+        response.headers.emplace("Content-Disposition", "attachment; filename=\"" + argFilename + "\"");
     return output_content;
 }
 
 std::string simpleToClashR(RESPONSE_CALLBACK_ARGS)
 {
-    std::string url = argument.size() <= 8 ? "" : argument.substr(8);
-    std::string base_content;
-    std::vector<nodeInfo> nodes;
-    string_array extra_group, extra_ruleset, include_remarks, exclude_remarks;
-    std::vector<ruleset_content> rca;
-    std::string subInfo;
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
 
-    if(!url.size() && !api_mode)
-        url = default_url;
+    std::string url = argument.size() <= 8 ? "" : argument.substr(8);
     if(!url.size() || argument.substr(0, 8) != "sublink=")
     {
         *status_code = 400;
@@ -1329,70 +1865,25 @@ std::string simpleToClashR(RESPONSE_CALLBACK_ARGS)
         *status_code = 400;
         return "Please insert your subscription link instead of clicking the default link.";
     }
-    if(insert_url.size())
-        url = insert_url + "|" + url;
-    if(!api_mode || cfw_child_process)
-        readConf();
-
-    extra_group = clash_extra_group;
-
-    if(update_ruleset_on_request || cfw_child_process)
-        refreshRulesets(rulesets, ruleset_content_array);
-    rca = ruleset_content_array;
-
-    extra_settings ext = {true, overwrite_original_rules, safe_get_renames(), safe_get_emojis(), add_emoji, remove_old_emoji, append_proxy_type, udp_flag, tfo_flag, false, do_sort, scv_flag, filter_deprecated, "", "", ""};
-
-    std::string proxy;
-    if(proxy_subscription == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_subscription == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_subscription;
-
-    include_remarks = def_include_remarks;
-    exclude_remarks = def_exclude_remarks;
-
-    //start parsing urls
-    int groupID = 0;
-    string_array dummy;
-    string_array urls = split(url, "|");
-    for(std::string &x : urls)
-    {
-        x = trim(x);
-        std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-        if(addNodes(x, nodes, groupID, proxy, exclude_remarks, include_remarks, dummy, dummy, subInfo, false) == -1)
-        {
-            *status_code = 400;
-            return std::string("The following link doesn't contain any valid node info: " + x);
-        }
-        groupID++;
-    }
-    //exit if found nothing
-    if(!nodes.size())
-    {
-        *status_code = 400;
-        return "No nodes were found!";
-    }
-
-    std::cerr<<"Generate target: ClashR\n";
-
-    YAML::Node yamlnode = safe_get_clash_base();
-    netchToClash(nodes, yamlnode, extra_group, true, ext);
-    return YAML::Dump(yamlnode);
+    request.argument = "target=clashr&url=" + UrlEncode(url);
+    return subconverter(request, response);
 }
 
 std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
 {
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
+
     INIReader ini;
-    YAML::Node clash = safe_get_clash_base();
     string_array dummy_str_array;
     std::vector<nodeInfo> nodes;
-    std::string base_content, url = argument.size() <= 5 ? "" : argument.substr(5), dummy;
+    std::string base_content, url = argument.size() <= 5 ? "" : argument.substr(5);
+    const std::string proxygroup_name = gClashUseNewField ? "proxy-groups" : "Proxy Group", rule_name = gClashUseNewField ? "rules" : "Rule";
+
     ini.store_any_line = true;
 
     if(!url.size())
-        url = default_url;
+        url = gDefaultUrls;
     if(!url.size() || argument.substr(0, 5) != "link=")
     {
         *status_code = 400;
@@ -1403,41 +1894,41 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
         *status_code = 400;
         return "Please insert your subscription link instead of clicking the default link.";
     }
+    writeLog(0, "SurgeConfToClash called with url '" + url + "'.", LOG_LEVEL_INFO);
 
-    std::string proxy;
-    if(proxy_config == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_config == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_config;
+    std::string proxy = parseProxy(gProxyConfig);
+    YAML::Node clash;
+    template_args tpl_args;
+    tpl_args.global_vars = gTemplateVars;
+    tpl_args.local_vars["clash.new_field_name"] = gClashUseNewField ? "true" : "false";
+    tpl_args.request_params["target"] = "clash";
+    tpl_args.request_params["url"] = url;
 
-    if(fileExist(url))
-        base_content = fileGet(url);
-    else
-        base_content = webGet(url, proxy, dummy, cache_config);
+    if(render_template(fetchFile(gClashBase, proxy, gCacheConfig), tpl_args, base_content, gTemplatePath) != 0)
+    {
+        *status_code = 400;
+        return base_content;
+    }
+    clash = YAML::Load(base_content);
+
+    base_content = fetchFile(url, proxy, gCacheConfig);
 
     if(ini.Parse(base_content) != INIREADER_EXCEPTION_NONE)
     {
         std::string errmsg = "Parsing Surge config failed! Reason: " + ini.GetLastError();
-        std::cerr<<errmsg<<"\n";
+        //std::cerr<<errmsg<<"\n";
+        writeLog(0, errmsg, LOG_LEVEL_ERROR);
         *status_code = 400;
         return errmsg;
     }
     if(!ini.SectionExist("Proxy") || !ini.SectionExist("Proxy Group") || !ini.SectionExist("Rule"))
     {
         std::string errmsg = "Incomplete surge config! Missing critical sections!";
-        std::cerr<<errmsg<<"\n";
+        //std::cerr<<errmsg<<"\n";
+        writeLog(0, errmsg, LOG_LEVEL_ERROR);
         *status_code = 400;
         return errmsg;
     }
-
-    if(proxy_subscription == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_subscription == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_subscription;
 
     //scan groups first, get potential policy-path
     string_multimap section;
@@ -1461,26 +1952,35 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
         singlegroup["type"] = type;
         for(unsigned int i = 1; i < dummy_str_array.size(); i++)
         {
-            if(dummy_str_array[i].find("url") == 0)
+            if(startsWith(dummy_str_array[i], "url"))
                 singlegroup["url"] = trim(dummy_str_array[i].substr(dummy_str_array[i].find("=") + 1));
-            else if(dummy_str_array[i].find("interval") == 0)
+            else if(startsWith(dummy_str_array[i], "interval"))
                 singlegroup["interval"] = trim(dummy_str_array[i].substr(dummy_str_array[i].find("=") + 1));
-            else if(dummy_str_array[i].find("policy-path") == 0)
+            else if(startsWith(dummy_str_array[i], "policy-path"))
                 links.emplace_back(trim(dummy_str_array[i].substr(dummy_str_array[i].find("=") + 1)));
             else
                 singlegroup["proxies"].push_back(trim(dummy_str_array[i]));
         }
-        clash["Proxy Group"].push_back(singlegroup);
+        clash[proxygroup_name].push_back(singlegroup);
     }
+
+    proxy = parseProxy(gProxySubscription);
+    eraseElements(dummy_str_array);
 
     std::string subInfo;
     for(std::string &x : links)
     {
-        std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-        if(addNodes(x, nodes, 0, proxy, dummy_str_array, dummy_str_array, dummy_str_array, dummy_str_array, subInfo, false) == -1)
+        //std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
+        writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+        if(addNodes(x, nodes, 0, proxy, dummy_str_array, dummy_str_array, dummy_str_array, dummy_str_array, subInfo, !gAPIMode, request.headers) == -1)
         {
-            *status_code = 400;
-            return std::string("The following link doesn't contain any valid node info: " + x);
+            if(gSkipFailedLinks)
+                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
+            else
+            {
+                *status_code = 400;
+                return "The following link doesn't contain any valid node info: " + x;
+            }
         }
     }
 
@@ -1491,7 +1991,8 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
         return "No nodes were found!";
     }
 
-    extra_settings ext = {true, true, dummy_str_array, dummy_str_array, false, false, false, udp_flag, tfo_flag, false, do_sort, scv_flag, filter_deprecated, "", "", ""};
+    extra_settings ext = {true, true, dummy_str_array, dummy_str_array, false, false, false, false, gEnableSort, gFilterDeprecated, gClashUseNewField, false, "", "", "", gUDP, gTFO, gSkipCertVerify, gTLS13};
+    ext.clash_proxies_style = gClashProxiesStyle;
 
     netchToClash(nodes, clash, dummy_str_array, false, ext);
 
@@ -1506,21 +2007,23 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
         if(!dummy_str_array.size())
             continue;
         content = trim(dummy_str_array[0]);
-        if(content == "direct")
+        switch(hash_(content))
         {
+        case "direct"_hash:
             singlegroup["name"] = name;
             singlegroup["type"] = "select";
             singlegroup["proxies"].push_back("DIRECT");
-        }
-        else if(content == "reject")
-        {
+            break;
+        case "reject"_hash:
+        case "reject-tinygif"_hash:
             singlegroup["name"] = name;
             singlegroup["type"] = "select";
             singlegroup["proxies"].push_back("REJECT");
-        }
-        else
+            break;
+        default:
             continue;
-        clash["Proxy Group"].push_back(singlegroup);
+        }
+        clash[proxygroup_name].push_back(singlegroup);
     }
 
     eraseElements(dummy_str_array);
@@ -1532,51 +2035,55 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
     std::string::size_type lineSize;
     for(std::string &x : dummy_str_array)
     {
-        if(x.find("USER-AGENT") == 0 || x.find("URL-REGEX") == 0 || x.find("PROCESS-NAME") == 0 || x.find("AND") == 0 || x.find("OR") == 0) //remove unsupported types
-            continue;
-        else if(x.find("RULE-SET") == 0)
+        if(startsWith(x, "RULE-SET"))
         {
             strArray = split(x, ",");
             if(strArray.size() != 3)
                 continue;
-            content = webGet(strArray[1], proxy, dummy, cache_ruleset);
+            content = webGet(strArray[1], proxy, gCacheRuleset);
             if(!content.size())
                 continue;
 
             ss << content;
-            char delimiter = count(content.begin(), content.end(), '\n') < 1 ? '\r' : '\n';
+            char delimiter = getLineBreak(content);
 
             while(getline(ss, strLine, delimiter))
             {
                 lineSize = strLine.size();
-                if(strLine[lineSize - 1] == '\r') //remove line break
-                {
-                    strLine = strLine.substr(0, lineSize - 1);
-                    lineSize--;
-                }
+                if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
+                    strLine.erase(--lineSize);
                 if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                     continue;
-                else if(strLine.find("USER-AGENT") == 0 || strLine.find("URL-REGEX") == 0 || strLine.find("PROCESS-NAME") == 0 || strLine.find("AND") == 0 || strLine.find("OR") == 0) //remove unsupported types
+                else if(!std::any_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](std::string type){return startsWith(strLine, type);})) //remove unsupported types
                     continue;
                 strLine += strArray[2];
-                if(std::count(strLine.begin(), strLine.end(), ',') > 2)
+                if(count_least(strLine, ',', 3))
                     strLine = regReplace(strLine, "^(.*?,.*?)(,.*)(,.*)$", "$1$3$2");
                 rule.push_back(strLine);
             }
             ss.clear();
             continue;
         }
+        else if(!std::any_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](std::string type){return startsWith(strLine, type);}))
+            continue;
         rule.push_back(x);
     }
-    clash["Rule"] = rule;
+    clash[rule_name] = rule;
 
+    response.headers["profile-update-interval"] = std::to_string(gUpdateInterval / 3600);
+    writeLog(0, "Conversion completed.", LOG_LEVEL_INFO);
     return YAML::Dump(clash);
 }
 
 std::string getProfile(RESPONSE_CALLBACK_ARGS)
 {
-    std::string name = UrlDecode(getUrlArg(argument, "name")), token = UrlDecode(getUrlArg(argument, "token")), expand = getUrlArg(argument, "expand");
-    if(token != access_token)
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
+
+    std::string name = UrlDecode(getUrlArg(argument, "name")), token = UrlDecode(getUrlArg(argument, "token"));
+    string_array profiles = split(name, "|");
+    name = profiles[0];
+    if(token.empty() || name.empty())
     {
         *status_code = 403;
         return "Forbidden";
@@ -1586,54 +2093,101 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS)
         *status_code = 404;
         return "Profile not found";
     }
-    std::cerr<<"Trying to load profile '" + name + "'.\n";
+    //std::cerr<<"Trying to load profile '" + name + "'.\n";
+    writeLog(0, "Trying to load profile '" + name + "'.", LOG_LEVEL_INFO);
     INIReader ini;
     if(ini.ParseFile(name) != INIREADER_EXCEPTION_NONE && !ini.SectionExist("Profile"))
     {
-        std::cerr<<"Load profile failed! Reason: "<<ini.GetLastError()<<"\n";
+        //std::cerr<<"Load profile failed! Reason: "<<ini.GetLastError()<<"\n";
+        writeLog(0, "Load profile failed! Reason: " + ini.GetLastError(), LOG_LEVEL_ERROR);
         *status_code = 500;
         return "Broken profile!";
     }
-    std::cerr<<"Trying to parse profile '" + name + "'.\n";
+    //std::cerr<<"Trying to parse profile '" + name + "'.\n";
+    writeLog(0, "Trying to parse profile '" + name + "'.", LOG_LEVEL_INFO);
     string_multimap contents;
     ini.GetItems("Profile", contents);
     if(!contents.size())
     {
-        std::cerr<<"Load profile failed! Reason: Empty Profile section\n";
+        //std::cerr<<"Load profile failed! Reason: Empty Profile section\n";
+        writeLog(0, "Load profile failed! Reason: Empty Profile section", LOG_LEVEL_ERROR);
         *status_code = 500;
         return "Broken profile!";
     }
-    contents.emplace("token", token);
-    contents.emplace("expand", expand);
-    std::string query;
-    for(auto &x : contents)
+    auto profile_token = contents.find("profile_token");
+    if(profiles.size() == 1 && profile_token != contents.end())
     {
-        query += x.first + "=" + UrlEncode(x.second) + "&";
+        if(token != profile_token->second)
+        {
+            *status_code = 403;
+            return "Forbidden";
+        }
+        token = gAccessToken;
     }
-    query.erase(query.size() - 1);
-    return subconverter(query, postdata, status_code, extra_headers);
+    else
+    {
+        if(token != gAccessToken)
+        {
+            *status_code = 403;
+            return "Forbidden";
+        }
+    }
+    /// check if more than one profile is provided
+    if(profiles.size() > 1)
+    {
+        writeLog(0, "Multiple profiles are provided. Trying to combine profiles...", LOG_TYPE_INFO);
+        std::string all_urls, url;
+        auto iter = contents.find("url");
+        if(iter != contents.end())
+            all_urls = iter->second;
+        for(size_t i = 1; i < profiles.size(); i++)
+        {
+            name = profiles[i];
+            if(!fileExist(name))
+            {
+                writeLog(0, "Ignoring non-exist profile '" + name + "'...", LOG_LEVEL_WARNING);
+                continue;
+            }
+            if(ini.ParseFile(name) != INIREADER_EXCEPTION_NONE && !ini.SectionExist("Profile"))
+            {
+                writeLog(0, "Ignoring broken profile '" + name + "'...", LOG_LEVEL_WARNING);
+                continue;
+            }
+            url = ini.Get("Profile", "url");
+            if(url.size())
+            {
+                all_urls += "|" + url;
+                writeLog(0, "Profile url from '" + name + "' added.", LOG_LEVEL_INFO);
+            }
+            else
+            {
+                writeLog(0, "Profile '" + name + "' does not have url key. Skipping...", LOG_LEVEL_INFO);
+            }
+        }
+        iter->second = all_urls;
+    }
+
+    contents.emplace("token", token);
+    contents.emplace("profile_data", base64_encode(gManagedConfigPrefix + "/getprofile?" + argument));
+    std::string query = std::accumulate(contents.begin(), contents.end(), std::string(), [](const std::string &x, auto y){ return x + y.first + "=" + UrlEncode(y.second) + "&"; });
+    query += argument;
+    request.argument = query;
+    return subconverter(request, response);
 }
 
 std::string getScript(RESPONSE_CALLBACK_ARGS)
 {
+    std::string &argument = request.argument;
+
     std::string url = urlsafe_base64_decode(getUrlArg(argument, "url")), dev_id = getUrlArg(argument, "id");
-    std::string output_content, dummy;
+    std::string output_content;
 
-    std::string proxy;
-    if(proxy_config == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_config == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_config;
+    std::string proxy = parseProxy(gProxyConfig);
 
-    if(fileExist(url))
-        output_content = fileGet(url, true);
-    else
-        output_content = webGet(url, proxy, dummy, cache_config);
+    output_content = fetchFile(url, proxy, gCacheConfig);
 
     if(!dev_id.size())
-        dev_id = quanx_script_id;
+        dev_id = gQuanXDevID;
 
     const std::string pattern = "(\\/\\*[\\s\\S]*?)^(.*?@supported )(.*?\\s?)$([\\s\\S]*\\*\\/\\s?";
     if(dev_id.size())
@@ -1648,24 +2202,17 @@ std::string getScript(RESPONSE_CALLBACK_ARGS)
 
 std::string getRewriteRemote(RESPONSE_CALLBACK_ARGS)
 {
+    std::string &argument = request.argument;
+
     std::string url = urlsafe_base64_decode(getUrlArg(argument, "url")), dev_id = getUrlArg(argument, "id");
-    std::string output_content, dummy;
+    std::string output_content;
 
-    std::string proxy;
-    if(proxy_config == "SYSTEM")
-        proxy = getSystemProxy();
-    else if(proxy_config == "NONE")
-        proxy = "";
-    else
-        proxy = proxy_config;
+    std::string proxy = parseProxy(gProxyConfig);
 
-    if(fileExist(url))
-        output_content = fileGet(url, true);
-    else
-        output_content = webGet(url, proxy, dummy, cache_config);
+    output_content = fetchFile(url, proxy, gCacheConfig);
 
     if(!dev_id.size())
-        dev_id = quanx_script_id;
+        dev_id = gQuanXDevID;
 
     if(dev_id.size())
     {
@@ -1673,7 +2220,7 @@ std::string getRewriteRemote(RESPONSE_CALLBACK_ARGS)
         std::string strLine;
         const std::string pattern = "^(.*? url script-.*? )(.*?)$";
         string_size lineSize;
-        char delimiter = count(output_content.begin(), output_content.end(), '\n') < 1 ? '\r' : '\n';
+        char delimiter = getLineBreak(output_content);
 
         ss << output_content;
         output_content.clear();
@@ -1681,14 +2228,11 @@ std::string getRewriteRemote(RESPONSE_CALLBACK_ARGS)
         {
             lineSize = strLine.size();
             if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
-            {
-                strLine.erase(lineSize - 1);
-                lineSize--;
-            }
+                strLine.erase(--lineSize);
 
             if(!strLine.empty() && regMatch(strLine, pattern))
             {
-                url = managed_config_prefix + "/qx-script?id=" + dev_id + "&url=" + urlsafe_base64_encode(regReplace(strLine, pattern, "$2"));
+                url = gManagedConfigPrefix + "/qx-script?id=" + dev_id + "&url=" + urlsafe_base64_encode(regReplace(strLine, pattern, "$2"));
                 strLine = regReplace(strLine, pattern, "$1") + url;
             }
             output_content.append(strLine + "\n");
@@ -1697,38 +2241,129 @@ std::string getRewriteRemote(RESPONSE_CALLBACK_ARGS)
     return output_content;
 }
 
+std::string parseHostname(inja::Arguments &args)
+{
+    std::string data = args.at(0)->get<std::string>(), hostname;
+    const std::string matcher = R"(^(?i:hostname\s*?=\s*?)(.*?)\s$)";
+    string_array urls = split(data, ",");
+    if(!urls.size())
+        return std::string();
+
+    std::string input_content, output_content, proxy = parseProxy(gProxyConfig);
+    for(std::string &x : urls)
+    {
+        input_content = webGet(x, proxy, gCacheConfig);
+        regGetMatch(input_content, matcher, 2, 0, &hostname);
+        if(hostname.size())
+        {
+            output_content += hostname + ",";
+            hostname.clear();
+        }
+    }
+    string_array vArray = split(output_content, ",");
+    std::set<std::string> hostnames;
+    for(std::string &x : vArray)
+        hostnames.emplace(trim(x));
+    output_content = std::accumulate(hostnames.begin(), hostnames.end(), std::string(), [](std::string a, std::string b)
+    {
+        return std::move(a) + "," + std::move(b);
+    });
+    return output_content;
+}
+
+std::string template_webGet(inja::Arguments &args)
+{
+    std::string data = args.at(0)->get<std::string>(), proxy = parseProxy(gProxyConfig);
+    writeLog(0, "Template called fetch with url '" + data + "'.", LOG_LEVEL_INFO);
+    return webGet(data, proxy, gCacheConfig);
+}
+
+std::string jinja2_webGet(const std::string &url)
+{
+    std::string proxy = parseProxy(gProxyConfig);
+    writeLog(0, "Template called fetch with url '" + url + "'.", LOG_LEVEL_INFO);
+    return webGet(url, proxy, gCacheConfig);
+}
+
+static inline std::string intToStream(unsigned long long stream)
+{
+    char chrs[16] = {}, units[6] = {' ', 'K', 'M', 'G', 'T', 'P'};
+    double streamval = stream;
+    unsigned int level = 0;
+    while(streamval > 1024.0)
+    {
+        if(level >= 5)
+            break;
+        level++;
+        streamval /= 1024.0;
+    }
+    snprintf(chrs, 15, "%.2f %cB", streamval, units[level]);
+    return std::string(chrs);
+}
+
+std::string subInfoToMessage(std::string subinfo)
+{
+    typedef unsigned long long ull;
+    subinfo = replace_all_distinct(subinfo, "; ", "&");
+    std::string retdata, useddata = "N/A", totaldata = "N/A", expirydata = "N/A";
+    std::string upload = getUrlArg(subinfo, "upload"), download = getUrlArg(subinfo, "download"), total = getUrlArg(subinfo, "total"), expire = getUrlArg(subinfo, "expire");
+    ull used = to_number<ull>(upload, 0) + to_number<ull>(download, 0), tot = to_number<ull>(total, 0);
+    time_t expiry = to_number<time_t>(expire, 0);
+    if(used != 0)
+        useddata = intToStream(used);
+    if(tot != 0)
+        totaldata = intToStream(tot);
+    if(expiry != 0)
+    {
+        char buffer[30];
+        struct tm *dt = localtime(&expiry);
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", dt);
+        expirydata.assign(buffer);
+    }
+    if(useddata == "N/A" && totaldata == "N/A" && expirydata == "N/A")
+        retdata = "Not Available";
+    else
+        retdata += "Stream Used: " + useddata + " Stream Total: " + totaldata + " Expiry Time: " + expirydata;
+    return retdata;
+}
 
 int simpleGenerator()
 {
-    std::cerr<<"\nReading generator configuration...\n";
+    //std::cerr<<"\nReading generator configuration...\n";
+    writeLog(0, "Reading generator configuration...", LOG_LEVEL_INFO);
     std::string config = fileGet("generate.ini"), path, profile, arguments, content;
     if(config.empty())
     {
-        std::cerr<<"Generator configuration not found or empty!\n";
+        //std::cerr<<"Generator configuration not found or empty!\n";
+        writeLog(0, "Generator configuration not found or empty!", LOG_LEVEL_ERROR);
         return -1;
     }
 
     INIReader ini;
     if(ini.Parse(config) != INIREADER_EXCEPTION_NONE)
     {
-        std::cerr<<"Generator configuration broken! Reason:"<<ini.GetLastError()<<"\n";
+        //std::cerr<<"Generator configuration broken! Reason:"<<ini.GetLastError()<<"\n";
+        writeLog(0, "Generator configuration broken! Reason:" + ini.GetLastError(), LOG_LEVEL_ERROR);
         return -2;
     }
-    std::cerr<<"Read generator configuration completed.\n\n";
+    //std::cerr<<"Read generator configuration completed.\n\n";
+    writeLog(0, "Read generator configuration completed.\n", LOG_LEVEL_INFO);
 
     string_array sections = ini.GetSections();
-    if(gen_profile.size())
+    if(gGenerateProfiles.size())
     {
-        std::cerr<<"Generating with specific artifacts: \""<<gen_profile<<"\"...\n";
-        string_array targets = split(gen_profile, ","), new_targets;
+        //std::cerr<<"Generating with specific artifacts: \""<<gen_profile<<"\"...\n";
+        writeLog(0, "Generating with specific artifacts: \"" + gGenerateProfiles + "\"...", LOG_LEVEL_INFO);
+        string_array targets = split(gGenerateProfiles, ","), new_targets;
         for(std::string &x : targets)
         {
             x = trim(x);
             if(std::find(sections.cbegin(), sections.cend(), x) != sections.cend())
-                new_targets.emplace_back(x);
+                new_targets.emplace_back(std::move(x));
             else
             {
-                std::cerr<<"Artifact \""<<x<<"\" not found in generator settings!\n";
+                //std::cerr<<"Artifact \""<<x<<"\" not found in generator settings!\n";
+                writeLog(0, "Artifact \"" + x + "\" not found in generator settings!", LOG_LEVEL_ERROR);
                 return -3;
             }
         }
@@ -1736,52 +2371,44 @@ int simpleGenerator()
         sections.shrink_to_fit();
     }
     else
-        std::cerr<<"Generating all artifacts...\n";
+        //std::cerr<<"Generating all artifacts...\n";
+        writeLog(0, "Generating all artifacts...", LOG_LEVEL_INFO);
 
     string_multimap allItems;
-    std::string dummy_str;
-    std::map<std::string, std::string> dummy_map;
-    int ret_code = 200;
+    std::string proxy = parseProxy(gProxySubscription);
+    Request request;
+    Response response;
     for(std::string &x : sections)
     {
         arguments.clear();
-        ret_code = 200;
-        std::cerr<<"Generating artifact '"<<x<<"'...\n";
+        response.status_code = 200;
+        //std::cerr<<"Generating artifact '"<<x<<"'...\n";
+        writeLog(0, "Generating artifact '" + x + "'...", LOG_LEVEL_INFO);
         ini.EnterSection(x);
         if(ini.ItemExist("path"))
             path = ini.Get("path");
         else
         {
-            std::cerr<<"Artifact '"<<x<<"' output path missing! Skipping...\n\n";
+            //std::cerr<<"Artifact '"<<x<<"' output path missing! Skipping...\n\n";
+            writeLog(0, "Artifact '" + x + "' output path missing! Skipping...\n", LOG_LEVEL_ERROR);
             continue;
         }
         if(ini.ItemExist("profile"))
         {
             profile = ini.Get("profile");
-            content = getProfile("name=" + UrlEncode(profile) + "&token=" + access_token + "&expand=true", dummy_str, &ret_code, dummy_map);
+            request.argument = "name=" + UrlEncode(profile) + "&token=" + gAccessToken + "&expand=true";
+            content = getProfile(request, response);
         }
         else
         {
             if(ini.GetBool("direct") == true)
             {
                 std::string url = ini.Get("url");
-                if(fileExist(url))
-                    content = fileGet(url, false);
-                else
-                {
-                    //check for proxy settings
-                    std::string proxy;
-                    if(proxy_subscription == "SYSTEM")
-                        proxy = getSystemProxy();
-                    else if(proxy_subscription == "NONE")
-                        proxy = "";
-                    else
-                        proxy = proxy_subscription;
-                    content = webGet(url, proxy);
-                }
+                content = fetchFile(url, proxy, gCacheSubscription);
                 if(content.empty())
                 {
-                    std::cerr<<"Artifact '"<<x<<"' generate ERROR! Please check your link.\n\n";
+                    //std::cerr<<"Artifact '"<<x<<"' generate ERROR! Please check your link.\n\n";
+                    writeLog(0, "Artifact '" + x + "' generate ERROR! Please check your link.\n", LOG_LEVEL_ERROR);
                     if(sections.size() == 1)
                         return -1;
                 }
@@ -1798,18 +2425,74 @@ int simpleGenerator()
                 arguments += y.first + "=" + UrlEncode(y.second) + "&";
             }
             arguments.erase(arguments.size() - 1);
-            content = subconverter(arguments, dummy_str, &ret_code, dummy_map);
+            request.argument = arguments;
+            content = subconverter(request, response);
         }
-        if(ret_code != 200)
+        if(response.status_code != 200)
         {
-            std::cerr<<"Artifact '"<<x<<"' generate ERROR! Reason: "<<content<<"\n\n";
+            //std::cerr<<"Artifact '"<<x<<"' generate ERROR! Reason: "<<content<<"\n\n";
+            writeLog(0, "Artifact '" + x + "' generate ERROR! Reason: " + content + "\n", LOG_LEVEL_ERROR);
             if(sections.size() == 1)
                 return -1;
             continue;
         }
         fileWrite(path, content, true);
-        std::cerr<<"Artifact '"<<x<<"' generate SUCCESS!\n\n";
+        auto iter = std::find_if(response.headers.begin(), response.headers.end(), [](auto y){ return y.first == "Subscription-UserInfo"; });
+        if(iter != response.headers.end())
+            writeLog(0, "User Info for artifact '" + x + "': " + subInfoToMessage(iter->second), LOG_LEVEL_INFO);
+        //std::cerr<<"Artifact '"<<x<<"' generate SUCCESS!\n\n";
+        writeLog(0, "Artifact '" + x + "' generate SUCCESS!\n", LOG_LEVEL_INFO);
+        eraseElements(response.headers);
     }
-    std::cerr<<"All artifact generated. Exiting...\n";
+    //std::cerr<<"All artifact generated. Exiting...\n";
+    writeLog(0, "All artifact generated. Exiting...", LOG_LEVEL_INFO);
     return 0;
+}
+
+std::string renderTemplate(RESPONSE_CALLBACK_ARGS)
+{
+    std::string &argument = request.argument;
+    int *status_code = &response.status_code;
+
+    std::string path = UrlDecode(getUrlArg(argument, "path"));
+    writeLog(0, "Trying to render template '" + path + "'...", LOG_LEVEL_INFO);
+
+    if(!startsWith(path, gTemplatePath) || !fileExist(path))
+    {
+        *status_code = 404;
+        return "Not found";
+    }
+    std::string template_content = fetchFile(path, parseProxy(gProxyConfig), gCacheConfig);
+    if(template_content.empty())
+    {
+        *status_code = 400;
+        return "File empty or out of scope";
+    }
+    template_args tpl_args;
+    tpl_args.global_vars = gTemplateVars;
+
+    //load request arguments as template variables
+    string_array req_args = split(argument, "&");
+    string_size pos;
+    string_map req_arg_map;
+    for(std::string &x : req_args)
+    {
+        pos = x.find("=");
+        if(pos == x.npos)
+            req_arg_map[x] = "";
+        else
+            req_arg_map[x.substr(0, pos)] = x.substr(pos + 1);
+    }
+    tpl_args.request_params = req_arg_map;
+
+    std::string output_content;
+    if(render_template(template_content, tpl_args, output_content, gTemplatePath) != 0)
+    {
+        *status_code = 400;
+        writeLog(0, "Render failed with error.", LOG_LEVEL_WARNING);
+    }
+    else
+        writeLog(0, "Render completed.", LOG_LEVEL_INFO);
+
+    return output_content;
 }

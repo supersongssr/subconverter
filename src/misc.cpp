@@ -1,32 +1,40 @@
 #include <chrono>
-//#include <regex>
 #include <fstream>
 #include <thread>
 #include <sstream>
 #include <iosfwd>
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
 //#include <filesystem>
 #include <unistd.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 
+/*
 #ifdef USE_STD_REGEX
 #include <regex>
 #else
+*/
 #include <jpcre2.hpp>
 typedef jpcre2::select<char> jp;
-#endif // USE_STD_REGEX
+//#endif // USE_STD_REGEX
 
 #include <rapidjson/document.h>
 
+/*
 #ifdef USE_MBEDTLS
 #include <mbedtls/md5.h>
 #else
 #include <openssl/md5.h>
 #endif // USE_MBEDTLS
+*/
+#include "md5.h"
 
 #include "misc.h"
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 //#include <io.h>
 #include <windows.h>
 #include <winreg.h>
@@ -69,10 +77,8 @@ std::string ACPToUTF8(const std::string &str_src)
     memset(str, 0, len + 1);
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str, len, NULL, NULL);
     std::string strTemp = str;
-    if(wstr)
-        delete[] wstr;
-    if(str)
-        delete[] str;
+    delete[] wstr;
+    delete[] str;
     return strTemp;
 #else
     return str_src;
@@ -127,7 +133,7 @@ unsigned char ToHex(unsigned char x)
 
 unsigned char FromHex(unsigned char x)
 {
-    unsigned char y = '\0';
+    unsigned char y;
     if (x >= 'A' && x <= 'Z')
         y = x - 'A' + 10;
     else if (x >= 'a' && x <= 'z')
@@ -188,10 +194,12 @@ std::string UrlDecode(const std::string& str)
     return strTemp;
 }
 
+/*
 static inline bool is_base64(unsigned char c)
 {
-    return (isalnum(c) || (c == '+') || (c == '/'));
+    return (isalnum(c) || (c == '+') || (c == '/') || (c == '-') || (c == '_'));
 }
+*/
 
 std::string base64_encode(const std::string &string_to_encode)
 {
@@ -200,7 +208,6 @@ std::string base64_encode(const std::string &string_to_encode)
 
     std::string ret;
     int i = 0;
-    int j = 0;
     unsigned char char_array_3[3];
     unsigned char char_array_4[4];
 
@@ -222,6 +229,7 @@ std::string base64_encode(const std::string &string_to_encode)
 
     if (i)
     {
+        int j;
         for(j = i; j < 3; j++)
             char_array_3[j] = '\0';
 
@@ -247,7 +255,7 @@ std::string base64_decode(const std::string &encoded_string, bool accept_urlsafe
     string_size in_len = encoded_string.size();
     string_size i = 0;
     string_size in_ = 0;
-    unsigned char char_array_4[4], char_array_3[3], uchar = 0;
+    unsigned char char_array_4[4], char_array_3[3], uchar;
     static unsigned char dtable[256], itable[256], table_ready = 0;
     std::string ret;
 
@@ -261,9 +269,10 @@ std::string base64_decode(const std::string &encoded_string, bool accept_urlsafe
             dtable[uchar] = k;  // decode (find)
             itable[uchar] = 1;  // is_base64
         }
+        const unsigned char dash = '-', add = '+', under = '_', slash = '/';
         // Add urlsafe table
-        dtable['-'] = dtable['+']; itable['-'] = 2;
-        dtable['_'] = dtable['/']; itable['_'] = 2;
+        dtable[dash] = dtable[add]; itable[dash] = 2;
+        dtable[under] = dtable[slash]; itable[under] = 2;
         table_ready = 1;
     }
 
@@ -271,7 +280,12 @@ std::string base64_decode(const std::string &encoded_string, bool accept_urlsafe
     {
         uchar = encoded_string[in_]; // make compiler happy
         if (!(accept_urlsafe ? itable[uchar] : (itable[uchar] == 1))) // break away from the while condition
+        {
+            ret += uchar; // not base64 encoded data, copy to result
+            in_++;
+            i = 0;
             continue;
+        }
         char_array_4[i++] = uchar;
         in_++;
         if (i == 4)
@@ -429,27 +443,60 @@ std::string getSystemProxy()
     //return 0;
     return std::string();
 #else
-    char* proxy = getenv("ALL_PROXY");
-    if(proxy != NULL)
-        return std::string(proxy);
-    else
-        return std::string();
+    string_array proxy_env = {"all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"};
+    for(std::string &x : proxy_env)
+    {
+        char* proxy = getenv(x.c_str());
+        if(proxy != NULL)
+            return std::string(proxy);
+    }
+    return std::string();
 #endif // _WIN32
 }
 
-std::string trim(const std::string& str)
+void trim_self_of(std::string &str, char target, bool before, bool after)
 {
-    std::string::size_type pos = str.find_first_not_of(' ');
+    if (!before && !after)
+        return;
+    std::string::size_type pos = str.size() - 1;
+    if (after)
+        pos = str.find_last_not_of(target);
+    if (pos != std::string::npos)
+        str.erase(pos + 1);
+    if (before)
+        pos = str.find_first_not_of(target);
+    str.erase(0, pos);
+}
+
+std::string trim_of(const std::string& str, char target, bool before, bool after)
+{
+    if (!before && !after)
+        return str;
+    std::string::size_type pos = 0;
+    if (before)
+        pos = str.find_first_not_of(target);
     if (pos == std::string::npos)
     {
         return str;
     }
-    std::string::size_type pos2 = str.find_last_not_of(' ');
+    std::string::size_type pos2 = str.size() - 1;
+    if (after)
+        pos2 = str.find_last_not_of(target);
     if (pos2 != std::string::npos)
     {
         return str.substr(pos, pos2 - pos + 1);
     }
     return str.substr(pos);
+}
+
+std::string trim(const std::string& str, bool before, bool after)
+{
+    return trim_of(str, ' ', before, after);
+}
+
+std::string trim_quote(const std::string &str, bool before, bool after)
+{
+    return trim_of(str, '\"', before, after);
 }
 
 std::string getUrlArg(const std::string &url, const std::string &request)
@@ -486,11 +533,21 @@ std::string getUrlArg(const std::string &url, const std::string &request)
     }
     */
     std::string pattern = request + "=";
-    std::string::size_type pos = url.rfind(pattern);
-    if(pos != url.npos)
+    std::string::size_type pos = url.size();
+    while(pos)
     {
-        pos += pattern.size();
-        return url.substr(pos, url.find("&", pos) - pos);
+        pos = url.rfind(pattern, pos);
+        if(pos != url.npos)
+        {
+            if(pos == 0 || url[pos - 1] == '&' || url[pos - 1] == '?')
+            {
+                pos += pattern.size();
+                return url.substr(pos, url.find("&", pos) - pos);
+            }
+        }
+        else
+            break;
+        pos--;
     }
     return std::string();
 }
@@ -506,7 +563,7 @@ std::string replace_all_distinct(std::string str, const std::string &old_value, 
     }
     return str;
 }
-
+/*
 #ifdef USE_STD_REGEX
 bool regValid(const std::string &reg)
 {
@@ -583,41 +640,119 @@ bool regMatch(const std::string &src, const std::string &match)
     }
 }
 
+int regGetMatch(const std::string &src, const std::string &match, size_t group_count, ...)
+{
+    try
+    {
+        std::regex::flag_type flags = std::regex::extended | std::regex::ECMAScript;
+        std::string target = match;
+        if(match.find("(?i)") == 0)
+        {
+            target.erase(0, 4);
+            flags |= std::regex::icase;
+        }
+        std::regex reg(target, flags);
+        std::smatch result;
+        if(regex_search(src.cbegin(), src.cend(), result, reg))
+        {
+            if(result.size() < group_count - 1)
+                return -1;
+            va_list vl;
+            va_start(vl, group_count);
+            size_t index = 0;
+            while(group_count)
+            {
+                std::string* arg = va_arg(vl, std::string*);
+                if(arg != NULL)
+                    *arg = std::move(result[index]);
+                index++;
+                group_count--;
+            }
+            va_end(vl);
+        }
+        else
+            return -2;
+        return 0;
+    }
+    catch (std::regex_error&)
+    {
+        return -3;
+    }
+}
+
 #else
-
-bool regMatch(const std::string &src, const std::string &target)
+*/
+bool regMatch(const std::string &src, const std::string &match)
 {
     jp::Regex reg;
-    reg.setPattern(target).addModifier("gm").addPcre2Option(PCRE2_ANCHORED|PCRE2_ENDANCHORED).compile();
+    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_ANCHORED|PCRE2_ENDANCHORED|PCRE2_UTF).compile();
     if(!reg)
         return false;
-    return reg.match(src);
+    return reg.match(src, "g");
 }
 
-bool regFind(const std::string &src, const std::string &target)
+bool regFind(const std::string &src, const std::string &match)
 {
     jp::Regex reg;
-    reg.setPattern(target).addModifier("gm").compile();
+    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
     if(!reg)
         return false;
-    return reg.match(src);
+    return reg.match(src, "g");
 }
 
-std::string regReplace(const std::string &src, const std::string &target, const std::string &rep)
+std::string regReplace(const std::string &src, const std::string &match, const std::string &rep, bool global, bool multiline)
 {
     jp::Regex reg;
-    reg.setPattern(target).addModifier("gm").compile();
+    reg.setPattern(match).addModifier(multiline ? "m" : "").addPcre2Option(PCRE2_UTF|PCRE2_MULTILINE|PCRE2_ALT_BSUX).compile();
     if(!reg)
         return src;
-    return reg.replace(src, rep);
+    return reg.replace(src, rep, global ? "gx" : "x");
 }
 
-bool regValid(const std::string &target)
+bool regValid(const std::string &reg)
 {
-    jp::Regex reg(target);
-    return !!reg;
+    jp::Regex r;
+    r.setPattern(reg).addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
+    return !!r;
 }
-#endif // USE_STD_REGEX
+
+int regGetMatch(const std::string &src, const std::string &match, size_t group_count, ...)
+{
+    jp::Regex reg;
+    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
+    jp::VecNum vec_num;
+    jp::RegexMatch rm;
+    size_t count = rm.setRegexObject(&reg).setSubject(src).setNumberedSubstringVector(&vec_num).setModifier("g").match();
+    if(!count)
+        return -1;
+    va_list vl;
+    va_start(vl, group_count);
+    size_t index = 0, match_index = 0;
+    while(group_count)
+    {
+        std::string* arg = va_arg(vl, std::string*);
+        if(arg != NULL)
+            *arg = std::move(vec_num[match_index][index]);
+        index++;
+        group_count--;
+        if(vec_num[match_index].size() <= index)
+        {
+            match_index++;
+            index = 0;
+        }
+        if(vec_num.size() <= match_index)
+            break;
+    }
+    va_end(vl);
+    return 0;
+}
+
+//#endif // USE_STD_REGEX
+
+std::string regTrim(const std::string &src)
+{
+    return regReplace(src, "^\\s*([\\s\\S]*)\\s*$", "$1", false, false);
+}
 
 std::string speedCalc(double speed)
 {
@@ -660,6 +795,8 @@ std::string urlsafe_base64_encode(const std::string &string_to_encode)
 std::string getMD5(const std::string &data)
 {
     std::string result;
+
+    /*
     unsigned int i = 0;
     unsigned char digest[16] = {};
 
@@ -685,8 +822,28 @@ std::string getMD5(const std::string &data)
         snprintf(tmp, 3, "%02x", digest[i]);
         result += tmp;
     }
+    */
+
+    char result_str[MD5_STRING_SIZE];
+    md5::md5_t md5;
+    md5.process(data.data(), data.size());
+    md5.finish();
+    md5.get_string(result_str);
+    result.assign(result_str);
 
     return result;
+}
+
+bool isInScope(const std::string &path)
+{
+#ifdef _WIN32
+    if(path.find(":\\") != path.npos || path.find("..") != path.npos)
+        return false;
+#else
+    if(startsWith(path, "/") || path.find("..") != path.npos)
+        return false;
+#endif // _WIN32
+    return true;
 }
 
 // TODO: Add preprocessor option to disable (open web service safety)
@@ -694,22 +851,15 @@ std::string fileGet(const std::string &path, bool scope_limit)
 {
     std::string content;
 
-    if(scope_limit)
-    {
-#ifdef _WIN32
-        if(path.find(":\\") != path.npos || path.find("..") != path.npos)
-            return std::string();
-#else
-        if(path.find("/") == 0 || path.find("..") != path.npos)
-            return std::string();
-#endif // _WIN32
-    }
+    if(scope_limit && !isInScope(path))
+        return std::string();
 
     std::FILE *fp = std::fopen(path.c_str(), "rb");
     if(fp)
     {
         std::fseek(fp, 0, SEEK_END);
         long tot = std::ftell(fp);
+        /*
         char *data = new char[tot + 1];
         data[tot] = '\0';
         std::rewind(fp);
@@ -717,6 +867,11 @@ std::string fileGet(const std::string &path, bool scope_limit)
         std::fclose(fp);
         content.assign(data, tot);
         delete[] data;
+        */
+        content.resize(tot);
+        std::rewind(fp);
+        std::fread(&content[0], 1, tot, fp);
+        std::fclose(fp);
     }
 
     /*
@@ -733,11 +888,14 @@ std::string fileGet(const std::string &path, bool scope_limit)
     return content;
 }
 
-bool fileExist(const std::string &path)
+bool fileExist(const std::string &path, bool scope_limit)
 {
     //using c++17 standard, but may cause problem on clang
     //return std::filesystem::exists(path);
-    return _access(path.data(), 4) != -1;
+    if(scope_limit && !isInScope(path))
+        return false;
+    struct stat st;
+    return stat(path.data(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 bool fileCopy(const std::string &source, const std::string &dest)
@@ -775,12 +933,19 @@ std::string fileGetMD5(const std::string &filepath)
 
 int fileWrite(const std::string &path, const std::string &content, bool overwrite)
 {
+    /*
     std::fstream outfile;
     std::ios_base::openmode mode = overwrite ? std::ios_base::out : std::ios_base::app;
     mode |= std::ios_base::binary;
     outfile.open(path, mode);
     outfile << content;
     outfile.close();
+    return 0;
+    */
+    const char *mode = overwrite ? "wb" : "ab";
+    std::FILE *fp = std::fopen(path.c_str(), mode);
+    std::fwrite(content.c_str(), 1, content.size(), fp);
+    std::fclose(fp);
     return 0;
 }
 
@@ -827,20 +992,23 @@ std::string rand_str(const int len)
 void urlParse(std::string &url, std::string &host, std::string &path, int &port, bool &isTLS)
 {
     std::vector<std::string> args;
+    string_size pos;
 
     if(regMatch(url, "^https://(.*)"))
         isTLS = true;
     url = regReplace(url, "^(http|https)://", "");
-    if(url.find("/") == url.npos)
+    pos = url.find("/");
+    if(pos == url.npos)
     {
         host = url;
         path = "/";
     }
     else
     {
-        host = url.substr(0, url.find("/"));
-        path = url.substr(url.find("/"));
+        host = url.substr(0, pos);
+        path = url.substr(pos);
     }
+    pos = host.rfind(":");
     if(regFind(host, "\\[(.*)\\]")) //IPv6
     {
         args = split(regReplace(host, "\\[(.*)\\](.*)", "$1,$2"), ",");
@@ -848,10 +1016,10 @@ void urlParse(std::string &url, std::string &host, std::string &path, int &port,
             port = to_int(args[1].substr(1));
         host = args[0];
     }
-    else if(strFind(host, ":"))
+    else if(pos != host.npos)
     {
-        port = to_int(host.substr(host.rfind(":") + 1));
-        host = host.substr(0, host.rfind(":"));
+        port = to_int(host.substr(pos + 1));
+        host = host.substr(0, pos);
     }
     if(port == 0)
     {
@@ -866,10 +1034,9 @@ bool is_str_utf8(const std::string &data)
 {
     const char *str = data.c_str();
     unsigned int nBytes = 0;
-    unsigned char chr;
     for (unsigned int i = 0; str[i] != '\0'; ++i)
     {
-        chr = *(str + i);
+        unsigned char chr = *(str + i);
         if (nBytes == 0)
         {
             if (chr >= 0x80)
@@ -920,6 +1087,9 @@ void shortDisassemble(int source, unsigned short &num_a, unsigned short &num_b)
 
 int to_int(const std::string &str, int def_value)
 {
+    if(str.empty())
+        return def_value;
+    /*
     int retval = 0;
     char c;
     std::stringstream ss(str);
@@ -929,6 +1099,8 @@ int to_int(const std::string &str, int def_value)
         return def_value;
     else
         return retval;
+    */
+    return std::atoi(str.data());
 }
 
 std::string getFormData(const std::string &raw_data)
@@ -947,7 +1119,7 @@ std::string getFormData(const std::string &raw_data)
     {
         if(i == 0)
             boundary = line.substr(0, line.length() - 1); // Get boundary
-        else if(line.find(boundary) == 0)
+        else if(startsWith(line, boundary))
             break; // The end
         else if(line.length() == 1)
         {
@@ -959,11 +1131,10 @@ std::string getFormData(const std::string &raw_data)
             while(!endfile)
             {
                 int j = 0;
-                int k;
                 while(j < 256 && strstrm.get(c) && !endfile)
                 {
                     buffer[j] = c;
-                    k = 0;
+                    int k = 0;
                     // Verify if we are at the end
                     while(boundary[bl - 1 - k] == buffer[j - k])
                     {
@@ -990,10 +1161,9 @@ std::string getFormData(const std::string &raw_data)
 std::string UTF8ToCodePoint(const std::string &data)
 {
     std::stringstream ss;
-    int charcode = 0;
     for(std::string::size_type i = 0; i < data.size(); i++)
     {
-        charcode = data[i] & 0xff;
+        int charcode = data[i] & 0xff;
         if((charcode >> 7) == 0)
         {
             ss<<data[i];
@@ -1015,4 +1185,69 @@ std::string UTF8ToCodePoint(const std::string &data)
         }
     }
     return ss.str();
+}
+
+std::string toLower(const std::string &str)
+{
+    std::string result;
+    std::transform(str.begin(), str.end(), std::back_inserter(result), [](unsigned char c) { return std::tolower(c); });
+    return result;
+}
+
+std::string toUpper(const std::string &str)
+{
+    std::string result;
+    std::transform(str.begin(), str.end(), std::back_inserter(result), [](unsigned char c) { return std::toupper(c); });
+    return result;
+}
+
+void ProcessEscapeChar(std::string &str)
+{
+    string_size pos = str.find('\\');
+    while(pos != str.npos)
+    {
+        if(pos == str.size())
+            break;
+        switch(str[pos + 1])
+        {
+        case 'n':
+            str.replace(pos, 2, "\n");
+            break;
+        case 'r':
+            str.replace(pos, 2, "\r");
+            break;
+        case 't':
+            str.replace(pos, 2, "\t");
+            break;
+        default:
+            /// ignore others for backward compatibility
+            //str.erase(pos, 1);
+            break;
+        }
+        pos = str.find('\\', pos + 1);
+    }
+}
+
+void ProcessEscapeCharReverse(std::string &str)
+{
+    string_size pos = 0;
+    while(pos < str.size())
+    {
+        switch(str[pos])
+        {
+        case '\n':
+            str.replace(pos, 1, "\\n");
+            break;
+        case '\r':
+            str.replace(pos, 1, "\\r");
+            break;
+        case '\t':
+            str.replace(pos, 1, "\\t");
+            break;
+        default:
+            /// ignore others for backward compatibility
+            break;
+        }
+        pos++;
+    }
 }

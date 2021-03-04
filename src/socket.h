@@ -23,6 +23,7 @@
 #ifndef SA_INTERRUPT
 #define SA_INTERRUPT 0 //ignore this setting
 #endif
+#define SD_BOTH SHUT_RDWR
 #ifndef __hpux
 #include <sys/select.h>
 #endif /* __hpux */
@@ -48,7 +49,7 @@ int setTimeout(SOCKET s, int timeout);
 int startConnect(SOCKET sHost, std::string addr, int port);
 int simpleSend(std::string addr, int port, std::string data);
 int send_simple(SOCKET sHost, std::string data);
-std::string hostnameToIPAddr(std::string host);
+std::string hostnameToIPAddr(const std::string &host);
 int connectSocks5(SOCKET sHost, std::string username, std::string password);
 int connectThruSocks(SOCKET sHost, std::string host, int port);
 int connectThruHTTP(SOCKET sHost, std::string username, std::string password, std::string dsthost, int dstport);

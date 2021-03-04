@@ -1,10 +1,14 @@
 #include <string>
 #include <iostream>
+#include <thread>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "logger.h"
 
-extern bool print_debug_info;
+extern bool gPrintDbgInfo;
+int gLogLevel = LOG_LEVEL_INFO;
 
 std::string getTime(int type)
 {
@@ -32,9 +36,11 @@ std::string getTime(int type)
     return std::string(tmpbuf);
 }
 
-void writeLog(int type, std::string content)
+void writeLog(int type, const std::string &content, int level)
 {
-    //placeholder
-    if(print_debug_info)
-        std::cerr<<getTime(2)<<" [DEBUG] "<<content<<"\n";
+    if(level > gLogLevel)
+        return;
+    const char *levels[] = {"[FATL]", "[ERRO]", "[WARN]", "[INFO]", "[DEBG]", "[VERB]"};
+    std::cerr<<getTime(2)<<" ["<<getpid()<<" "<<std::this_thread::get_id()<<"]"<<levels[level % 6];
+    std::cerr<<" "<<content<<"\n";
 }
